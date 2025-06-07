@@ -1,0 +1,13 @@
+pandas
+numpy
+torch
+scikit-learn
+lightgbm
+clickhouse-connect
+kafka-python
+streamlit
+optuna
+shap
+ta-lib
+backtrader
+python-binance
