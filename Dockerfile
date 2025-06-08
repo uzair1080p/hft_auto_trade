@@ -23,7 +23,7 @@ RUN wget -q http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz &&
     make && \
     make install && \
     cd .. && rm -rf ta-lib ta-lib-0.4.0-src.tar.gz && \
-    ln -s /usr/lib/libta_lib.so.0 /usr/lib/libta_lib.so && \
+    ln -sf /usr/lib/libta_lib.so.0 /usr/lib/libta_lib.so && \
     ldconfig
 
 # ---------- python deps ----------
