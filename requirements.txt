@@ -8,6 +8,6 @@ kafka-python
 streamlit
 optuna
 shap
-ta-lib
+pandas-ta==0.3.14
 backtrader
 python-binance
