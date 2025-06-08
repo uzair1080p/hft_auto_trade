@@ -2,13 +2,12 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install system-level dependencies including TA-Lib
+# Install build tools and TA-Lib dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
     gcc \
-    curl \
     wget \
-    make \
+    curl \
     libffi-dev \
     libssl-dev \
     python3-dev \
@@ -19,11 +18,16 @@ RUN apt-get update && apt-get install -y \
     && cd .. && rm -rf ta-lib* \
     && rm -rf /var/lib/apt/lists/*
 
+# Set environment variables so linker finds libta_lib.so
+ENV LD_LIBRARY_PATH="/usr/lib:$LD_LIBRARY_PATH"
+ENV TA_LIBRARY_PATH="/usr/lib"
+
 # Install Python packages
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source code
+# Copy app source
 COPY . .
 
+# Default entrypoint
 ENTRYPOINT ["bash"]
