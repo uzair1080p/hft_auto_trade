@@ -2,38 +2,36 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install system dependencies and build tools
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    wget \
-    curl \
-    gcc \
-    make \
-    libffi-dev \
-    libssl-dev \
-    python3-dev \
-    git \
-    && rm -rf /var/lib/apt/lists/*
+# ---------- system toolchain ----------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        gcc \
+        make \
+        wget \
+        curl \
+        libffi-dev \
+        libssl-dev \
+        python3-dev \
+        git && \
+    rm -rf /var/lib/apt/lists/*
 
-# Build and install TA-Lib from source
-RUN wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && \
-    tar -xvzf ta-lib-0.4.0-src.tar.gz && \
+# ---------- build & register TA-Lib ----------
+RUN wget -q http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && \
+    tar -xzf ta-lib-0.4.0-src.tar.gz && \
     cd ta-lib && \
     ./configure --prefix=/usr && \
     make && \
     make install && \
-    cd .. && rm -rf ta-lib ta-lib-0.4.0-src.tar.gz
+    cd .. && rm -rf ta-lib ta-lib-0.4.0-src.tar.gz && \
+    ln -s /usr/lib/libta_lib.so.0 /usr/lib/libta_lib.so && \
+    ldconfig
 
-# Update library cache
-ENV LD_LIBRARY_PATH="/usr/lib:$LD_LIBRARY_PATH"
-RUN ldconfig
-
-# Install Python dependencies
+# ---------- python deps ----------
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-# Copy your project files
+# ---------- project ----------
 COPY . .
 
 ENTRYPOINT ["bash"]
