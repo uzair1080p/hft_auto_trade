@@ -2,7 +2,7 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install system dependencies and build TA-Lib from source
+# Step 1: Install build tools and dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
     gcc \
@@ -13,23 +13,29 @@ RUN apt-get update && apt-get install -y \
     python3-dev \
     git \
     make \
-    && wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz \
-    && tar -xvzf ta-lib-0.4.0-src.tar.gz \
-    && cd ta-lib && ./configure --prefix=/usr/local && make && make install \
-    && cd .. && rm -rf ta-lib* \
     && rm -rf /var/lib/apt/lists/*
 
-# Set environment variables to help find the TA-Lib shared object
-ENV LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH"
-ENV TA_LIBRARY_PATH="/usr/local/lib"
+# Step 2: Build and install TA-Lib C library
+RUN wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && \
+    tar -xvzf ta-lib-0.4.0-src.tar.gz && \
+    cd ta-lib && \
+    ./configure --prefix=/usr && \
+    make && \
+    make install && \
+    cd .. && \
+    rm -rf ta-lib*
 
-# Install Python dependencies
+# Step 3: Ensure linker can find it
+ENV LD_LIBRARY_PATH="/usr/lib:$LD_LIBRARY_PATH"
+RUN ldconfig
+
+# Step 4: Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+ && pip install --no-cache-dir -r requirements.txt
 
-# Copy the full app source code
+# Step 5: Copy source code
 COPY . .
 
-# Default entrypoint
+# Default shell
 ENTRYPOINT ["bash"]
