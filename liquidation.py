@@ -12,11 +12,16 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from binance import ThreadedWebsocketManager
 from clickhouse_connect import get_client
+import os
 
 # -------------------- Config --------------------
 
-API_KEY = 'YOUR_BINANCE_API_KEY'
-API_SECRET = 'YOUR_BINANCE_SECRET_KEY'
+API_KEY    = os.getenv("BINANCE_API_KEY")
+API_SECRET = os.getenv("BINANCE_API_SECRET")
+
+if not API_KEY or not API_SECRET:          # fail fast if keys are missing
+    raise RuntimeError("BINANCE_API_KEY / BINANCE_API_SECRET not set")
+
 SYMBOL = 'ethusdt'
 CLICKHOUSE_HOST = 'clickhouse'
 CLICKHOUSE_USER = 'default'
