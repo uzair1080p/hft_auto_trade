@@ -5,28 +5,21 @@ Consume !forceOrder liquidation stream → ClickHouse
 import json, time, logging, os, threading, websocket
 from datetime import datetime, timedelta
 from collections import deque
-
 from clickhouse_connect import get_client
 
 # ─────────────────────── CONFIG ───────────────────────
-API_KEY    = os.getenv("BINANCE_API_KEY")   # kept for parity (not used by public stream)
-API_SECRET = os.getenv("BINANCE_API_SECRET")
 SYMBOL = "ethusdt"      # lower-case for endpoint
 
-CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST", "clickhouse")
-CLICKHOUSE_PORT = int(os.getenv("CLICKHOUSE_PORT", 8123))
-CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", "default")
-CLICKHOUSE_PASS = os.getenv("CLICKHOUSE_PASSWORD", "")
-
-ck = get_client(
-    host=CLICKHOUSE_HOST,
-    port=CLICKHOUSE_PORT,
-    username=CLICKHOUSE_USER,
-    password=CLICKHOUSE_PASS,
+CLICKHOUSE = dict(
+    host=os.getenv("CLICKHOUSE_HOST", "clickhouse"),
+    port=int(os.getenv("CLICKHOUSE_PORT", 8123)),
+    username=os.getenv("CLICKHOUSE_USER", "default"),
+    password=os.getenv("CLICKHOUSE_PASSWORD", ""),
     compress=True,
 )
 
-# ensure table exists (idempotent)
+ck = get_client(**CLICKHOUSE)
+
 ck.command("""
 CREATE TABLE IF NOT EXISTS liquidation_features (
     timestamp                DateTime,
@@ -38,16 +31,13 @@ CREATE TABLE IF NOT EXISTS liquidation_features (
 
 # ───────────────── CLUSTER ACCUMULATOR ────────────────
 class LiquidationWindow:
-    def __init__(self, window_sec: int = 30):
-        self.window = timedelta(seconds=window_sec)
+    def __init__(self, secs: int = 30):
+        self.window = timedelta(seconds=secs)
         self.events = deque()   # (ts, side, value_usd)
 
     def add(self, ts, side, value):
         self.events.append((ts, side, value))
-        self._prune(ts)
-
-    def _prune(self, now):
-        cutoff = now - self.window
+        cutoff = ts - self.window
         while self.events and self.events[0][0] < cutoff:
             self.events.popleft()
 
@@ -65,42 +55,48 @@ class LiquidationWindow:
 # ───────────────────────── Main ───────────────────────
 def main():
     logging.basicConfig(level=logging.INFO)
-    window = LiquidationWindow()
+    win        = LiquidationWindow()
     last_flush = time.time()
 
     def on_msg(_, raw: str):
-        """WebSocket message handler"""
+        """
+        Binance sends either:
+        • aggregated {"e":"forceOrder","o":{...}}
+        • raw order  {"o":{...}}
+        • legacy     {"S": ... , "p": ...}
+        Always normalise to `order = msg["o"] or msg`.
+        """
         try:
-            msg = json.loads(raw)
-            # msg format from !forceOrder@arr
-            side  = "buy"  if msg["S"] == "SELL" else "sell"  # inverse
-            price = float(msg["p"])
-            qty   = float(msg["q"])
-            ts    = datetime.utcfromtimestamp(msg["T"] / 1000)
-            window.add(ts, side, price * qty)
-        except Exception as e:
-            logging.error(f"Liquidation parse error: {e}")
+            msg   = json.loads(raw)
+            order = msg.get("o") or msg    # tolerate both shapes
+            side  = "buy" if order["S"] == "SELL" else "sell"  # inverse
+            price = float(order.get("ap") or order["p"])
+            qty   = float(order["q"])
+            ts    = datetime.utcfromtimestamp(order["T"] / 1000)
+            win.add(ts, side, price * qty)
+        except (KeyError, ValueError):
+            logging.debug(f"Ignoring non-order message: {raw[:100]}…")
+        except Exception as exc:
+            logging.error(f"Liquidation parse error: {exc}")
 
-    # ---- connect to global liquidation stream (no auth required) ----
-    url = "wss://fstream.binance.com/ws/!forceOrder@arr"
+    url    = "wss://fstream.binance.com/ws/!forceOrder@arr"
     ws_app = websocket.WebSocketApp(url, on_message=on_msg)
 
     def _run_ws():
         while True:
             try:
                 ws_app.run_forever(ping_interval=20, ping_timeout=10)
-            except Exception as e:
-                logging.error(f"WebSocket error: {e}; reconnecting in 5s")
+            except Exception as exc:
+                logging.error(f"WebSocket error: {exc} – reconnecting in 5 s")
                 time.sleep(5)
 
     threading.Thread(target=_run_ws, daemon=True).start()
 
-    # ---- periodic ClickHouse flush ----
     try:
         while True:
             time.sleep(1)
             if time.time() - last_flush >= 30:
-                row = window.snapshot()
+                row = win.snapshot()
                 ck.insert("liquidation_features", [row])
                 logging.info(f"[{row['timestamp']}] Logged liquidation cluster")
                 last_flush = time.time()

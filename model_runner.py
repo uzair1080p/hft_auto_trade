@@ -1,107 +1,132 @@
 """
-Consume !forceOrder liquidation stream → ClickHouse
+LSTM + LightGBM ensemble → ClickHouse table executed_trades
 """
 
-import json, time, logging, os, threading, websocket
-from datetime import datetime, timedelta
-from collections import deque
+import json, logging, os, pathlib, time
+from datetime import datetime as dt
+
+import pandas as pd
+import torch, lightgbm as lgb
+from sklearn.preprocessing import RobustScaler
 from clickhouse_connect import get_client
 
-# ─────────────────────── CONFIG ───────────────────────
-SYMBOL = "ethusdt"      # lower-case for endpoint
 
+# ───────── CONFIG ─────────
 CLICKHOUSE = dict(
     host=os.getenv("CLICKHOUSE_HOST", "clickhouse"),
-    port=int(os.getenv("CLICKHOUSE_PORT", 8123)),
     username=os.getenv("CLICKHOUSE_USER", "default"),
     password=os.getenv("CLICKHOUSE_PASSWORD", ""),
     compress=True,
 )
 
+SYMBOL           = "ETHUSDT"
+LOOKBACK         = 20
+SLEEP_SEC        = 60
+LSTM_WEIGHTS     = pathlib.Path("models/lstm_model.pth")
+LGBM_FILE        = pathlib.Path("models/lightgbm_model.txt")
+
 ck = get_client(**CLICKHOUSE)
 
+# auto-DDL
 ck.command("""
-CREATE TABLE IF NOT EXISTS liquidation_features (
-    timestamp                DateTime,
-    symbol                   String,
-    liquidation_cluster_size Float64,
-    liquidation_imbalance    Float64
-) ENGINE = MergeTree ORDER BY (symbol, timestamp)
+CREATE TABLE IF NOT EXISTS futures_features (
+    ts        DateTime,
+    symbol    String,
+    features  JSON,
+    raw_data  JSON
+) ENGINE = MergeTree ORDER BY (symbol, ts)
 """)
 
-# ───────────────── CLUSTER ACCUMULATOR ────────────────
-class LiquidationWindow:
-    def __init__(self, secs: int = 30):
-        self.window = timedelta(seconds=secs)
-        self.events = deque()   # (ts, side, value_usd)
+ck.command("""
+CREATE TABLE IF NOT EXISTS executed_trades (
+    ts      DateTime,
+    symbol  String,
+    signal  Int8,
+    score   Float32
+) ENGINE = MergeTree ORDER BY (symbol, ts)
+""")
 
-    def add(self, ts, side, value):
-        self.events.append((ts, side, value))
-        cutoff = ts - self.window
-        while self.events and self.events[0][0] < cutoff:
-            self.events.popleft()
+# ───────── helpers ─────────
+def last_n_features(n=LOOKBACK):
+    rows = ck.query(
+        f"SELECT features FROM futures_features "
+        f"WHERE symbol='{SYMBOL}' ORDER BY ts DESC LIMIT {n}"
+    ).result_rows[::-1]
+    return None if len(rows) < n else pd.DataFrame(
+        [json.loads(r[0]) for r in rows]
+    )
 
-    def snapshot(self):
-        longs  = sum(v for _, s, v in self.events if s == "buy")
-        shorts = sum(v for _, s, v in self.events if s == "sell")
-        total  = longs + shorts
-        return {
-            "timestamp": datetime.utcnow(),
-            "symbol": SYMBOL.upper(),
-            "liquidation_cluster_size": total,
-            "liquidation_imbalance": (longs - shorts) / (total + 1e-8),
-        }
+def log_trade(signal, score):
+    ck.insert("executed_trades", [{
+        "ts": dt.utcnow(),
+        "symbol": SYMBOL,
+        "signal": int(signal),
+        "score": float(score),
+    }])
+    logging.info(f"signal {signal:+d}  score {score:0.4f}")
 
-# ───────────────────────── Main ───────────────────────
-def main():
-    logging.basicConfig(level=logging.INFO)
-    win        = LiquidationWindow()
-    last_flush = time.time()
+# ───────── bootstrap / wait for data ─────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 
-    def on_msg(_, raw: str):
-        """
-        Binance sends either:
-        • aggregated {"e":"forceOrder","o":{...}}
-        • raw order  {"o":{...}}
-        • legacy     {"S": ... , "p": ...}
-        Always normalise to `order = msg["o"] or msg`.
-        """
-        try:
-            msg   = json.loads(raw)
-            order = msg.get("o") or msg    # tolerate both shapes
-            side  = "buy" if order["S"] == "SELL" else "sell"  # inverse
-            price = float(order.get("ap") or order["p"])
-            qty   = float(order["q"])
-            ts    = datetime.utcfromtimestamp(order["T"] / 1000)
-            win.add(ts, side, price * qty)
-        except (KeyError, ValueError):
-            logging.debug(f"Ignoring non-order message: {raw[:100]}…")
-        except Exception as exc:
-            logging.error(f"Liquidation parse error: {exc}")
+probe = None
+for _ in range(40):                 # wait up to ~4 minutes
+    probe = last_n_features(1)
+    if probe is not None:
+        break
+    logging.info("Waiting for first feature row …")
+    time.sleep(6)
 
-    url    = "wss://fstream.binance.com/ws/!forceOrder@arr"
-    ws_app = websocket.WebSocketApp(url, on_message=on_msg)
+if probe is None:
+    logging.error("No features arrived; model runner exits.")
+    raise SystemExit(1)
 
-    def _run_ws():
-        while True:
-            try:
-                ws_app.run_forever(ping_interval=20, ping_timeout=10)
-            except Exception as exc:
-                logging.error(f"WebSocket error: {exc} – reconnecting in 5 s")
-                time.sleep(5)
+INPUT_DIM = probe.shape[1]
+scaler    = RobustScaler().fit(probe)
 
-    threading.Thread(target=_run_ws, daemon=True).start()
+# ───────── model defs ─────────
+class LSTM(torch.nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.lstm = torch.nn.LSTM(d, 32, batch_first=True)
+        self.fc   = torch.nn.Linear(32, 1)
+    def forward(self, x):
+        return self.fc(self.lstm(x)[0][:, -1])
 
+lstm = LSTM(INPUT_DIM)
+if LSTM_WEIGHTS.exists():
+    lstm.load_state_dict(torch.load(LSTM_WEIGHTS, map_location="cpu"))
+    logging.info("✓ LSTM weights loaded")
+else:
+    logging.warning("⚠️  No LSTM weights; random init")
+
+lstm.eval()
+
+lgbm = lgb.Booster(model_file=str(LGBM_FILE)) if LGBM_FILE.exists() else None
+if lgbm:
+    logging.info("✓ LightGBM model loaded")
+else:
+    logging.warning("⚠️  No LightGBM model file; fallback prob=0.5")
+
+# ───────── main loop ─────────
+while True:
     try:
-        while True:
-            time.sleep(1)
-            if time.time() - last_flush >= 30:
-                row = win.snapshot()
-                ck.insert("liquidation_features", [row])
-                logging.info(f"[{row['timestamp']}] Logged liquidation cluster")
-                last_flush = time.time()
-    except KeyboardInterrupt:
-        logging.info("Shutdown requested — exiting")
+        df = last_n_features()
+        if df is None:
+            time.sleep(SLEEP_SEC)
+            continue
 
-if __name__ == "__main__":
-    main()
+        x_seq = scaler.transform(df).reshape(1, LOOKBACK, -1)
+        lstm_prob = torch.sigmoid(
+            lstm(torch.tensor(x_seq, dtype=torch.float32))
+        ).item()
+        lgb_prob  = (lgbm.predict(x_seq[:, -1]) [0]
+                     if lgbm else 0.5)
+
+        score  = 0.6 * lstm_prob + 0.4 * lgb_prob
+        signal = 1 if score > 0.6 else -1 if score < 0.4 else 0
+        log_trade(signal, score)
+
+    except Exception as e:
+        logging.exception(e)
+
+    time.sleep(SLEEP_SEC)
