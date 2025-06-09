@@ -10,3 +10,4 @@ optuna
 shap
 backtrader
 python-binance
+websocket-client 
