@@ -1,70 +1,52 @@
 """
-Model-inference loop for the HFT bot
-––––––––––––––––––––––––––––––––––––
-• Pulls last 20 feature rows (futures_features)
-• Robust-scales → LSTM (sequence) + LightGBM (point)
-• Blended score → executed_trades
-• Auto-creates tables on first run and waits until features exist
+LSTM + LightGBM ensemble → ClickHouse table executed_trades
 """
 
-import json, os, time, logging, pathlib
+import json, logging, os, pathlib, time
 from datetime import datetime as dt
 
-import numpy as np
 import pandas as pd
 import torch, lightgbm as lgb
 from sklearn.preprocessing import RobustScaler
 from clickhouse_connect import get_client
 
 
-# ───────────────── CONFIG ─────────────────
+# ───────── CONFIG ─────────
 CLICKHOUSE = dict(
     host=os.getenv("CLICKHOUSE_HOST", "clickhouse"),
-    port=int(os.getenv("CLICKHOUSE_PORT", 8123)),
     username=os.getenv("CLICKHOUSE_USER", "default"),
     password=os.getenv("CLICKHOUSE_PASSWORD", ""),
     compress=True,
 )
 
-SYMBOL   = "ETHUSDT"
-LOOKBACK = 20
-SLEEP    = 60
+SYMBOL           = "ETHUSDT"
+LOOKBACK         = 20
+SLEEP_SEC        = 60
+LSTM_WEIGHTS     = pathlib.Path("models/lstm_model.pth")
+LGBM_FILE        = pathlib.Path("models/lightgbm_model.txt")
 
-LSTM_WEIGHTS = pathlib.Path("models/lstm_model.pth")
-LGBM_FILE    = pathlib.Path("models/lightgbm_model.txt")
-
-# ───────── ClickHouse client & DDL ────────
 ck = get_client(**CLICKHOUSE)
 
+# auto-DDL
 ck.command("""
 CREATE TABLE IF NOT EXISTS futures_features (
     ts        DateTime,
     symbol    String,
-    features  String,
-    raw_data  String
+    features  JSON,
+    raw_data  JSON
 ) ENGINE = MergeTree ORDER BY (symbol, ts)
 """)
 
 ck.command("""
 CREATE TABLE IF NOT EXISTS executed_trades (
-    ts     DateTime,
-    symbol String,
-    signal Int8,
-    score  Float32
+    ts      DateTime,
+    symbol  String,
+    signal  Int8,
+    score   Float32
 ) ENGINE = MergeTree ORDER BY (symbol, ts)
 """)
 
-# ───────── LSTM definition ───────────────
-class LSTM(torch.nn.Module):
-    def __init__(self, d: int):
-        super().__init__()
-        self.lstm = torch.nn.LSTM(d, 32, batch_first=True)
-        self.fc   = torch.nn.Linear(32, 1)
-
-    def forward(self, x):
-        return self.fc(self.lstm(x)[0][:, -1])
-
-# ───────── helper queries ────────────────
+# ───────── helpers ─────────
 def last_n_features(n=LOOKBACK):
     rows = ck.query(
         f"SELECT features FROM futures_features "
@@ -74,17 +56,20 @@ def last_n_features(n=LOOKBACK):
         [json.loads(r[0]) for r in rows]
     )
 
-def log_trade(ts, signal, score):
-    ck.insert("executed_trades",
-              [{"ts": ts, "symbol": SYMBOL,
-                "signal": int(signal), "score": float(score)}])
+def log_trade(signal, score):
+    ck.insert("executed_trades", [{
+        "ts": dt.utcnow(),
+        "symbol": SYMBOL,
+        "signal": int(signal),
+        "score": float(score),
+    }])
+    logging.info(f"signal {signal:+d}  score {score:0.4f}")
 
-# ───────── bootstrap / warm-up ───────────
+# ───────── bootstrap / wait for data ─────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 
-# wait until at least one feature row exists
 probe = None
-for _ in range(30):                           # ~3 min max
+for _ in range(40):                 # wait up to ~4 minutes
     probe = last_n_features(1)
     if probe is not None:
         break
@@ -92,59 +77,56 @@ for _ in range(30):                           # ~3 min max
     time.sleep(6)
 
 if probe is None:
-    logging.error("No features arrived; exiting.")
+    logging.error("No features arrived; model runner exits.")
     raise SystemExit(1)
 
 INPUT_DIM = probe.shape[1]
+scaler    = RobustScaler().fit(probe)
 
-# scaler fit on up to 1000 rows
-hist_rows = ck.query(
-    f"SELECT features FROM futures_features "
-    f"WHERE symbol='{SYMBOL}' ORDER BY ts DESC LIMIT 1000"
-).result_rows
-scaler = RobustScaler().fit(
-    pd.DataFrame([json.loads(r[0]) for r in hist_rows]) if hist_rows else probe
-)
+# ───────── model defs ─────────
+class LSTM(torch.nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.lstm = torch.nn.LSTM(d, 32, batch_first=True)
+        self.fc   = torch.nn.Linear(32, 1)
+    def forward(self, x):
+        return self.fc(self.lstm(x)[0][:, -1])
 
-# load / init models
 lstm = LSTM(INPUT_DIM)
 if LSTM_WEIGHTS.exists():
     lstm.load_state_dict(torch.load(LSTM_WEIGHTS, map_location="cpu"))
     logging.info("✓ LSTM weights loaded")
 else:
-    logging.warning("⚠️  No LSTM weights, using random init")
+    logging.warning("⚠️  No LSTM weights; random init")
 
 lstm.eval()
 
-lgbm = None
-if LGBM_FILE.exists():
-    lgbm = lgb.Booster(model_file=str(LGBM_FILE))
+lgbm = lgb.Booster(model_file=str(LGBM_FILE)) if LGBM_FILE.exists() else None
+if lgbm:
     logging.info("✓ LightGBM model loaded")
 else:
-    logging.warning("⚠️  No LightGBM model file")
+    logging.warning("⚠️  No LightGBM model file; fallback prob=0.5")
 
-# ───────── main loop ─────────────────────
+# ───────── main loop ─────────
 while True:
     try:
-        seq_df = last_n_features()
-        if seq_df is None:
-            time.sleep(SLEEP)
+        df = last_n_features()
+        if df is None:
+            time.sleep(SLEEP_SEC)
             continue
 
-        norm = scaler.transform(seq_df).reshape(1, LOOKBACK, -1)
-        x_t  = torch.tensor(norm, dtype=torch.float32)
+        x_seq = scaler.transform(df).reshape(1, LOOKBACK, -1)
+        lstm_prob = torch.sigmoid(
+            lstm(torch.tensor(x_seq, dtype=torch.float32))
+        ).item()
+        lgb_prob  = (lgbm.predict(x_seq[:, -1]) [0]
+                     if lgbm else 0.5)
 
-        with torch.no_grad():
-            p_lstm = torch.sigmoid(lstm(x_t)).item()
-        p_lgb  = float(lgbm.predict(norm[:, -1, :])[0]) if lgbm else 0.5
-
-        score  = 0.6 * p_lstm + 0.4 * p_lgb
+        score  = 0.6 * lstm_prob + 0.4 * lgb_prob
         signal = 1 if score > 0.6 else -1 if score < 0.4 else 0
-
-        log_trade(dt.utcnow(), signal, score)
-        logging.info(f"signal {signal:+d} | score {score:0.4f}")
+        log_trade(signal, score)
 
     except Exception as e:
-        logging.exception(f"Model loop error: {e}")
+        logging.exception(e)
 
-    time.sleep(SLEEP)
+    time.sleep(SLEEP_SEC)
