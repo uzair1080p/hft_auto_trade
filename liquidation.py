@@ -68,7 +68,7 @@ def main():
         ts    = datetime.utcfromtimestamp(msg["T"] / 1000)
         window.add(ts, side, price * qty)
 
-    twm = ThreadedWebsocketManager(API_KEY, API_SECRET, raise_if_any_error=True)
+    twm = ThreadedWebsocketManager(API_KEY, API_SECRET)
     twm.start()
     # generic socket path for global liquidation stream
     twm.start_socket(callback=on_msg, path="/ws/!forceOrder@arr")

@@ -43,7 +43,7 @@ class CryptoCollector:
         self.trades      = deque(maxlen=500)
         self.kline_data  = pd.DataFrame()
         self.features    = {}
-        self.twm         = ThreadedWebsocketManager(API_KEY, API_SECRET, raise_if_any_error=True)
+        self.twm         = ThreadedWebsocketManager(API_KEY, API_SECRET)
 
     # ───────── WS START
     def start(self):
