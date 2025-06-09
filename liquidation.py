@@ -1,14 +1,16 @@
 """
 Consume !forceOrder liquidation stream → ClickHouse
+Requires `websocket-client` and `clickhouse-connect`
 """
 
-import json, time, logging, os, threading, websocket
+import json, time, logging, os, threading, websocket                 # pip install websocket-client
 from datetime import datetime, timedelta
 from collections import deque
+from typing import Deque, Tuple
 from clickhouse_connect import get_client
 
 # ───────────────────── CONFIG ─────────────────────
-SYMBOL = "ethusdt"                 # endpoint expects lower-case
+SYMBOL = "ethusdt"                     # endpoint expects lower-case
 
 CLICKHOUSE = dict(
     host=os.getenv("CLICKHOUSE_HOST", "clickhouse"),
@@ -32,27 +34,31 @@ CREATE TABLE IF NOT EXISTS liquidation_features (
 
 # ────────── sliding-window accumulator ──────────
 class LiquidationWindow:
+    """
+    Maintains last N-seconds of liquidation events and builds a
+    cluster snapshot on demand.
+    """
     def __init__(self, secs: int = 30):
-        self.window = timedelta(seconds=secs)
-        self.events: deque = deque()    # (ts, side, usd_value)
+        self.window: timedelta = timedelta(seconds=secs)
+        self.events: Deque[Tuple[datetime, str, float]] = deque()  # (ts, side, usd_value)
 
     def add(self, ts: datetime, side: str, value: float) -> None:
-        """Insert new event and prune anything older than window"""
         self.events.append((ts, side, value))
         cutoff = ts - self.window
         while self.events and self.events[0][0] < cutoff:
             self.events.popleft()
 
-    def snapshot(self) -> dict:
+    def snapshot(self) -> Tuple:
         longs  = sum(v for _, s, v in self.events if s == "buy")
         shorts = sum(v for _, s, v in self.events if s == "sell")
         total  = longs + shorts
-        return {
-            "timestamp": datetime.utcnow(),
-            "symbol":    SYMBOL.upper(),
-            "liquidation_cluster_size": total,
-            "liquidation_imbalance":    (longs - shorts) / (total + 1e-8),
-        }
+        imbalance = (longs - shorts) / (total + 1e-8)
+        return (
+            datetime.utcnow(),          # timestamp
+            SYMBOL.upper(),             # symbol
+            total,                      # liquidation_cluster_size
+            imbalance,                  # liquidation_imbalance
+        )
 
 # ─────────────────── WebSocket consumer ──────────────────
 def main() -> None:
@@ -62,24 +68,22 @@ def main() -> None:
     window      = LiquidationWindow()
     last_flush  = time.time()
 
-    # -- handle each incoming frame --
     def on_msg(_, raw: str) -> None:
         """
-        Binance !forceOrder messages appear in two shapes:
+        Handle every incoming frame from !forceOrder stream.
+        Shapes observed:
         • {"e":"forceOrder","o":{...}}
         • {"o":{...}}
-        Normalise by reading `order = msg.get("o") or msg`.
         """
         try:
             msg   = json.loads(raw)
             order = msg.get("o") or msg
-            side  = "buy" if order["S"] == "SELL" else "sell"   # inverse
-            price = float(order.get("ap") or order["p"])        # average-price if present
+            side  = "buy" if order["S"] == "SELL" else "sell"       # inverse
+            price = float(order.get("ap") or order["p"])
             qty   = float(order["q"])
             ts    = datetime.utcfromtimestamp(order["T"] / 1000)
             window.add(ts, side, price * qty)
         except (KeyError, ValueError):
-            # ignore keep-alives / malformed frames
             logging.debug("non-order frame ignored")
         except Exception as exc:
             logging.error("Liquidation parse error: %s", exc)
@@ -97,16 +101,16 @@ def main() -> None:
 
     threading.Thread(target=ws_loop, daemon=True).start()
 
-    # -- periodic ClickHouse flush every 30 s --
+    # ── periodic ClickHouse flush every 30 s ──
     try:
         while True:
             time.sleep(1)
             if time.time() - last_flush >= 30:
-                row = window.snapshot()
+                row_tuple = window.snapshot()      # tuple in correct order
 
                 ck.insert(
                     "liquidation_features",
-                    [row],
+                    [row_tuple],                   # list-of-tuples ✓
                     column_names=[
                         "timestamp",
                         "symbol",
@@ -117,9 +121,7 @@ def main() -> None:
 
                 logging.info(
                     "[%s] cluster size=%0.0f  imbalance=%+.3f",
-                    row["timestamp"],
-                    row["liquidation_cluster_size"],
-                    row["liquidation_imbalance"],
+                    row_tuple[0], row_tuple[2], row_tuple[3]
                 )
                 last_flush = time.time()
     except KeyboardInterrupt:
