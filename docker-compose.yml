@@ -44,7 +44,7 @@ services:
   streamlit_ui:
     build: .
     container_name: streamlit_ui
-    ports: ["8501:8501"]
+    ports: ["30080:8501"]
     depends_on: [clickhouse]
     command:
       - streamlit
