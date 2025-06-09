@@ -3,17 +3,21 @@ import pandas as pd
 import plotly.express as px
 from clickhouse_connect import get_client
 import numpy as np
+import os
 
 # -------------------- Config --------------------
 
-CLICKHOUSE_HOST = 'clickhouse'
-CLICKHOUSE_USER = 'default'
-CLICKHOUSE_PASS = ''
+CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST", "clickhouse")
+CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", "default")
+CLICKHOUSE_PASS = os.getenv("CLICKHOUSE_PASSWORD", "")
+CLICKHOUSE_PORT=int(os.getenv("CLICKHOUSE_PORT", 8123)),
 
 client = get_client(
     host=CLICKHOUSE_HOST,
+    port=CLICKHOUSE_PORT,
     username=CLICKHOUSE_USER,
-    password=CLICKHOUSE_PASS
+    password=CLICKHOUSE_PASS,
+    compress=True
 )
 
 st.set_page_config(layout="wide")
