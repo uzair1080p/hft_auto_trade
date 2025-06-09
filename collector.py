@@ -29,7 +29,7 @@ INTERVAL = '1m'
 
 CLICKHOUSE_HOST = 'clickhouse'
 CLICKHOUSE_USER = 'default'
-CLICKHOUSE_PASS = ''
+CLICKHOUSE_PASS = os.getenv("CLICKHOUSE_PASSWORD")
 
 # -------------------- ClickHouse Client --------------------
 

@@ -14,12 +14,13 @@ import lightgbm as lgb
 import logging
 from clickhouse_connect import get_client
 from sklearn.preprocessing import RobustScaler
+import os
 
 # -------------------- Config --------------------
 
 CLICKHOUSE_HOST = 'clickhouse'
 CLICKHOUSE_USER = 'default'
-CLICKHOUSE_PASS = ''
+CLICKHOUSE_PASS = os.getenv("CLICKHOUSE_PASSWORD")
 SYMBOL = 'ETHUSDT'
 LOOKBACK = 20  # LSTM sequence length
 INTERVAL_SECONDS = 60

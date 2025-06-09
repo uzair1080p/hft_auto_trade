@@ -1,9 +1,15 @@
+# -----------------------------------------------------------------------------
+#  docker-compose.yml   (no version key needed with Compose v2)
+# -----------------------------------------------------------------------------
+
 services:
+  # ---------------------------------------------------------------- ZOOKEEPER
   zookeeper:
     image: confluentinc/cp-zookeeper:7.3.0
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
 
+  # ----------------------------------------------------------------- KAFKA
   kafka:
     image: confluentinc/cp-kafka:7.3.0
     ports: ["9092:9092"]
@@ -14,44 +20,59 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
     depends_on: [zookeeper]
 
+  # ------------------------------------------------------------ CLICKHOUSE
   clickhouse:
     image: clickhouse/clickhouse-server:latest
     container_name: clickhouse
     ports:
-      - "8123:8123"   # HTTP
-      - "9000:9000"   # Native
+      - "8123:8123"     # HTTP
+      - "9000:9000"     # Native TCP
     volumes:
       - clickhouse_data:/var/lib/clickhouse
+    environment:
+      CLICKHOUSE_USER:      default
+      CLICKHOUSE_PASSWORD:  ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DB:        default
     ulimits:
       nofile:
         soft: 262144
         hard: 262144
 
+  # --------------------------------------------------------------- HFT APP
   hft_app:
     build: .
     container_name: hft_app
-    env_file:                # ← inject API keys from .env
-      - .env
+    env_file: [.env]                 # BINANCE_* and CLICKHOUSE_PASSWORD
     environment:
       PYTHONUNBUFFERED: "1"
-    volumes:                 # optional; keep read-only if you only need logs
-      - .:/app:ro
-    depends_on:
-      - kafka
-      - clickhouse
-    # uses ENTRYPOINT from Dockerfile
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    volumes:
+      - .:/app:ro                    # read-only live code (remove in prod)
+    depends_on: [kafka, clickhouse]
+    # uses ENTRYPOINT from Dockerfile  (/app/entrypoint.sh)
 
+  # ----------------------------------------------------------- STREAMLIT UI
   streamlit_ui:
     build: .
     container_name: streamlit_ui
-    ports: ["30080:8501"]
+    ports: ["30080:8501"]            # host 30080 → container 8501
+    env_file: [.env]                 # only ClickHouse creds needed
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
     depends_on: [clickhouse]
-    command:
+    entrypoint:                      # override to run Streamlit directly
       - streamlit
       - run
       - ui_dashboard.py
       - "--server.port=8501"
       - "--server.address=0.0.0.0"
 
+# ---------------------------------------------------------------- VOLUMES
 volumes:
   clickhouse_data:

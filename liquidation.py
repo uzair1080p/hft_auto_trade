@@ -25,7 +25,7 @@ if not API_KEY or not API_SECRET:          # fail fast if keys are missing
 SYMBOL = 'ethusdt'
 CLICKHOUSE_HOST = 'clickhouse'
 CLICKHOUSE_USER = 'default'
-CLICKHOUSE_PASS = ''
+CLICKHOUSE_PASS = os.getenv("CLICKHOUSE_PASSWORD")
 
 # -------------------- ClickHouse Client --------------------
 
