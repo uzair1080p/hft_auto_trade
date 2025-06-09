@@ -56,17 +56,23 @@ services:
 
   # ----------------------------------------------------------- STREAMLIT UI
   streamlit_ui:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - REQS=requirements_ui.txt      # <── use the Plotly-enabled list
     container_name: streamlit_ui
-    ports: ["30080:8501"]            # host 30080 → container 8501
-    env_file: [.env]                 # only ClickHouse creds needed
+    ports: ["30080:8501"]               # host 30080 → container 8501
+    env_file: [.env]                    # only ClickHouse creds needed
     environment:
       CLICKHOUSE_HOST: clickhouse
       CLICKHOUSE_PORT: 8123
       CLICKHOUSE_USER: default
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
     depends_on: [clickhouse]
-    entrypoint:                      # override to run Streamlit directly
+
+    # run Streamlit directly, bypassing /app/entrypoint.sh
+    entrypoint:
       - streamlit
       - run
       - ui_dashboard.py
