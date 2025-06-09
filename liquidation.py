@@ -1,93 +1,84 @@
-# liquidation.py
-
 """
-Consumes Binance liquidation events (!forceOrder) and computes liquidation cluster metrics.
-Stores results in ClickHouse every 30 seconds.
+Consume !forceOrder liquidation stream → ClickHouse
 """
 
-import json
-import time
-import logging
-from collections import defaultdict, deque
+import json, time, logging, os
 from datetime import datetime, timedelta
+from collections import deque
+
 from binance import ThreadedWebsocketManager
 from clickhouse_connect import get_client
-import os
 
-# -------------------- Config --------------------
-
+# ─────────────────────── CONFIG ───────────────────────
 API_KEY    = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
+if not (API_KEY and API_SECRET):
+    raise RuntimeError("Missing Binance keys")
 
-if not API_KEY or not API_SECRET:          # fail fast if keys are missing
-    raise RuntimeError("BINANCE_API_KEY / BINANCE_API_SECRET not set")
+SYMBOL = "ethusdt"      # lower-case for endpoint
+CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST", "clickhouse")
+CLICKHOUSE_PORT = int(os.getenv("CLICKHOUSE_PORT", 8123))
+CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", "default")
+CLICKHOUSE_PASS = os.getenv("CLICKHOUSE_PASSWORD", "")
 
-SYMBOL = 'ethusdt'
-CLICKHOUSE_HOST = 'clickhouse'
-CLICKHOUSE_USER = 'default'
-CLICKHOUSE_PASS = os.getenv("CLICKHOUSE_PASSWORD")
-
-# -------------------- ClickHouse Client --------------------
-
-client = get_client(
+ck = get_client(
     host=CLICKHOUSE_HOST,
+    port=CLICKHOUSE_PORT,
     username=CLICKHOUSE_USER,
     password=CLICKHOUSE_PASS,
-    compress=True
+    compress=True,
 )
 
-# -------------------- Liquidation Processor --------------------
+# ───────────────── CLUSTER ACCUMULATOR ────────────────
+class LiquidationWindow:
+    def __init__(self, window_sec=30):
+        self.window = timedelta(seconds=window_sec)
+        self.events = deque()   # (ts, side, value_usd)
 
-class LiquidationProcessor:
-    def __init__(self, symbol):
-        self.symbol = symbol
-        self.events = deque()
-        self.window = timedelta(seconds=30)
+    def add(self, ts, side, value):
+        self.events.append((ts, side, value))
+        self._prune(ts)
 
-    def process_event(self, event):
-        ts = datetime.utcfromtimestamp(event['T'] / 1000.0)
-        price = float(event['p'])
-        qty = float(event['q'])
-        side = 'buy' if event['S'] == 'SELL' else 'sell'  # inverse
-        value_usd = price * qty
-        self.events.append((ts, side, price, value_usd))
-        self._clean_old(ts)
-
-    def _clean_old(self, now):
-        while self.events and self.events[0][0] < now - self.window:
+    def _prune(self, now):
+        cutoff = now - self.window
+        while self.events and self.events[0][0] < cutoff:
             self.events.popleft()
 
-    def get_cluster_features(self):
-        longs = sum(val for ts, side, p, val in self.events if side == 'buy')
-        shorts = sum(val for ts, side, p, val in self.events if side == 'sell')
-        total = longs + shorts
-        imbalance = (longs - shorts) / (total + 1e-8)
+    def snapshot(self):
+        longs  = sum(v for _, s, v in self.events if s == "buy")
+        shorts = sum(v for _, s, v in self.events if s == "sell")
+        total  = longs + shorts
         return {
-            'timestamp': datetime.utcnow(),
-            'symbol': self.symbol.upper(),
-            'liquidation_cluster_size': total,
-            'liquidation_imbalance': imbalance
+            "timestamp": datetime.utcnow(),
+            "symbol": SYMBOL.upper(),
+            "liquidation_cluster_size": total,
+            "liquidation_imbalance": (longs - shorts) / (total + 1e-8),
         }
 
-# -------------------- WebSocket Consumer --------------------
-
+# ───────────────────────── Main ───────────────────────
 def main():
     logging.basicConfig(level=logging.INFO)
-    proc = LiquidationProcessor(SYMBOL)
+    window = LiquidationWindow()
 
-    def on_message(msg):
-        proc.process_event(msg)
+    def on_msg(msg: dict):
+        # msg format from !forceOrder@arr stream
+        side  = "buy"  if msg["S"] == "SELL" else "sell"  # inverse
+        price = float(msg["p"])
+        qty   = float(msg["q"])
+        ts    = datetime.utcfromtimestamp(msg["T"] / 1000)
+        window.add(ts, side, price * qty)
 
-    twm = ThreadedWebsocketManager(API_KEY, API_SECRET)
+    twm = ThreadedWebsocketManager(API_KEY, API_SECRET, raise_if_any_error=True)
     twm.start()
-    twm.start_liquidation_socket(callback=on_message, symbol=SYMBOL)
+    # generic socket path for global liquidation stream
+    twm.start_socket(callback=on_msg, path="/ws/!forceOrder@arr")
 
     try:
         while True:
             time.sleep(30)
-            features = proc.get_cluster_features()
-            client.insert("liquidation_features", [features])
-            logging.info(f"[{features['timestamp']}] Logged: {features}")
+            row = window.snapshot()
+            ck.insert("INSERT INTO liquidation_features VALUES", [row])
+            logging.info(f"[{row['timestamp']}] Logged liquidation cluster")
     except KeyboardInterrupt:
         twm.stop()
 

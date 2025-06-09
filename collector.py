@@ -1,170 +1,151 @@
-# collector.py
-
 """
-Collects real-time Binance futures data and pushes features into ClickHouse.
+Collect real-time Binance data → ClickHouse
 """
 
-import json
-import time
-import logging
-import pandas as pd
-import numpy as np
-from collections import defaultdict
+import json, time, logging, os
 from datetime import datetime
+from collections import deque
+
+import numpy as np
+import pandas as pd
 from binance import ThreadedWebsocketManager
 from clickhouse_connect import get_client
-import os
 
 
-# -------------------- Config --------------------
-
+# ──────────────────────── CONFIG ────────────────────────
 API_KEY    = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
+if not (API_KEY and API_SECRET):
+    raise RuntimeError("Missing BINANCE_API_KEY / BINANCE_API_SECRET")
 
-if not API_KEY or not API_SECRET:          # fail fast if keys are missing
-    raise RuntimeError("BINANCE_API_KEY / BINANCE_API_SECRET not set")
+SYMBOL   = "ethusdt"
+INTERVAL = "1m"
 
-SYMBOL = 'ETHUSDT'
-INTERVAL = '1m'
+CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST", "clickhouse")
+CLICKHOUSE_PORT = int(os.getenv("CLICKHOUSE_PORT", 8123))
+CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", "default")
+CLICKHOUSE_PASS = os.getenv("CLICKHOUSE_PASSWORD", "")
 
-CLICKHOUSE_HOST = 'clickhouse'
-CLICKHOUSE_USER = 'default'
-CLICKHOUSE_PASS = os.getenv("CLICKHOUSE_PASSWORD")
-
-# -------------------- ClickHouse Client --------------------
-
-clickhouse_client = get_client(
-    host=CLICKHOUSE_HOST, 
-    username=CLICKHOUSE_USER, 
+ck = get_client(
+    host=CLICKHOUSE_HOST,
+    port=CLICKHOUSE_PORT,
+    username=CLICKHOUSE_USER,
     password=CLICKHOUSE_PASS,
-    compress=True
+    compress=True,
 )
 
-# -------------------- Collector Class --------------------
-
-class CryptoDataCollector:
+# ──────────────────────── COLLECTOR ─────────────────────
+class CryptoCollector:
     def __init__(self, symbol=SYMBOL, interval=INTERVAL):
-        self.symbol = symbol.lower()
-        self.interval = interval
-        self.order_book = {'bids': [], 'asks': []}
-        self.trade_data = []
-        self.kline_data = pd.DataFrame()
-        self.features = {}
-        self.twm = ThreadedWebsocketManager(API_KEY, API_SECRET)
+        self.symbol      = symbol.lower()
+        self.interval    = interval
+        self.order_book  = {"bids": [], "asks": []}
+        self.trades      = deque(maxlen=500)
+        self.kline_data  = pd.DataFrame()
+        self.features    = {}
+        self.twm         = ThreadedWebsocketManager(API_KEY, API_SECRET, raise_if_any_error=True)
 
+    # ───────── WS START
     def start(self):
         self.twm.start()
-        self.twm.start_depth_socket(symbol=self.symbol, callback=self.handle_depth)
-        self.twm.start_trade_socket(symbol=self.symbol, callback=self.handle_trade)
-        self.twm.start_kline_socket(symbol=self.symbol, interval=self.interval, callback=self.handle_kline)
+        self.twm.start_depth_socket(symbol=self.symbol,  callback=self.on_depth)
+        self.twm.start_trade_socket(symbol=self.symbol,  callback=self.on_trade)
+        self.twm.start_kline_socket(symbol=self.symbol, interval=self.interval, callback=self.on_kline)
 
-    def handle_depth(self, msg):
-        self.order_book['bids'] = [(float(p), float(q)) for p, q in msg['bids']]
-        self.order_book['asks'] = [(float(p), float(q)) for p, q in msg['asks']]
-        self.compute_ob_features()
+    # ───────── handlers
+    def on_depth(self, msg: dict):
+        # Binance depth stream uses keys 'b' (bids) and 'a' (asks)
+        self.order_book["bids"] = [(float(p), float(q)) for p, q in msg["b"]]
+        self.order_book["asks"] = [(float(p), float(q)) for p, q in msg["a"]]
+        self._ob_features()
 
-    def handle_trade(self, msg):
-        trade = {
-            'price': float(msg['p']),
-            'qty': float(msg['q']),
-            'time': msg['T'],
-            'is_buyer_maker': msg['m']
-        }
-        self.trade_data.append(trade)
-        if len(self.trade_data) > 500:
-            self.trade_data = self.trade_data[-500:]
-
-    def handle_kline(self, msg):
-        k = msg['k']
-        if k['x']:  # closed candle
-            row = {
-                'ts': datetime.utcfromtimestamp(k['t'] / 1000.0),
-                'open': float(k['o']),
-                'high': float(k['h']),
-                'low': float(k['l']),
-                'close': float(k['c']),
-                'volume': float(k['v'])
+    def on_trade(self, msg: dict):
+        self.trades.append(
+            {
+                "price": float(msg["p"]),
+                "qty":   float(msg["q"]),
+                "time":  msg["T"],
+                "is_buyer_maker": msg["m"],
             }
-            self.kline_data = pd.concat([self.kline_data, pd.DataFrame([row])], ignore_index=True)
-            self.kline_data = self.kline_data.tail(500)
-            self.compute_technical_indicators()
-            self.push_to_clickhouse()
+        )
 
-    def compute_ob_features(self):
-        bids = self.order_book['bids']
-        asks = self.order_book['asks']
-        if not bids or not asks:
+    def on_kline(self, msg: dict):
+        k = msg["k"]
+        if not k["x"]:        # candle not closed yet
             return
+        row = {
+            "ts":     datetime.utcfromtimestamp(k["t"] / 1000),
+            "open":   float(k["o"]),
+            "high":   float(k["h"]),
+            "low":    float(k["l"]),
+            "close":  float(k["c"]),
+            "volume": float(k["v"]),
+        }
+        self.kline_data = pd.concat([self.kline_data, pd.DataFrame([row])], ignore_index=True).tail(500)
+        self._tech_indicators()
+        self._push_clickhouse()
 
-        bid_vol = sum(q for _, q in bids)
-        ask_vol = sum(q for _, q in asks)
-        ob_imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol + 1e-8)
-        top_bid = bids[0][0]
-        top_ask = asks[0][0]
-        spread = top_ask - top_bid
+    # ───────── feature calculators
+    def _ob_features(self):
+        bids, asks = self.order_book["bids"], self.order_book["asks"]
+        if not (bids and asks):
+            return
+        bid_vol, ask_vol = (sum(q for _, q in bids), sum(q for _, q in asks))
+        self.features.update(
+            ob_imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol + 1e-8),
+            spread       = asks[0][0] - bids[0][0],
+        )
 
-        self.features['ob_imbalance'] = ob_imbalance
-        self.features['spread'] = spread
-
-    def compute_technical_indicators(self):
+    def _tech_indicators(self):
         if len(self.kline_data) < 20:
             return
-        df = self.kline_data.copy()
-        df['ema_10'] = df['close'].ewm(span=10).mean()
-        df['rsi'] = compute_rsi(df['close'])
-        df['atr'] = compute_atr(df['high'], df['low'], df['close'])
-
+        df = self.kline_data
+        df["ema_10"] = df["close"].ewm(span=10).mean()
+        df["rsi"]    = _rsi(df["close"])
+        df["atr"]    = _atr(df["high"], df["low"], df["close"])
         last = df.iloc[-1]
-        self.features.update({
-            'ema_10': last['ema_10'],
-            'rsi': last['rsi'],
-            'atr': last['atr']
-        })
+        self.features.update(ema_10=last.ema_10, rsi=last.rsi, atr=last.atr)
 
-    def push_to_clickhouse(self):
-        now = datetime.utcnow()
+    # ───────── ClickHouse insert
+    def _push_clickhouse(self):
         row = {
-            'ts': now,
-            'symbol': SYMBOL,
-            'features': json.dumps(self.features),
-            'raw_data': json.dumps({
-                'order_book': self.order_book,
-                'trades': self.trade_data[-20:],
-                'kline': self.kline_data.iloc[-1:].to_dict(orient='records')[0]
-            })
+            "ts": datetime.utcnow(),
+            "symbol": SYMBOL.upper(),
+            "features": json.dumps(self.features),
+            "raw_data": json.dumps(
+                {
+                    "order_book": self.order_book,
+                    "trades":     list(self.trades)[-20:],
+                    "kline":      self.kline_data.iloc[-1].to_dict(),
+                },
+                default=str,           # serialize Timestamp
+            ),
         }
         try:
-            clickhouse_client.insert(
+            ck.insert(
                 "INSERT INTO futures_features (ts, symbol, features, raw_data) VALUES",
-                [row]
+                [row],
             )
-            print(f"[{now}] Inserted features for {SYMBOL}")
         except Exception as e:
-            logging.error(f"Failed to insert into ClickHouse: {e}")
+            logging.error(f"ClickHouse insert failed: {e!s}")
 
-# -------------------- Indicators --------------------
-
-def compute_rsi(series, period=14):
+# ─────────────────── helper indicators ──────────────────
+def _rsi(series, period=14):
     delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    ma_up = up.rolling(window=period).mean()
-    ma_down = down.rolling(window=period).mean()
-    rsi = 100 - (100 / (1 + ma_up / (ma_down + 1e-8)))
-    return rsi
+    up, down = delta.clip(lower=0), -delta.clip(upper=0)
+    ma_up, ma_down = up.rolling(period).mean(), down.rolling(period).mean()
+    return 100 - 100 / (1 + ma_up / (ma_down + 1e-8))
 
-def compute_atr(high, low, close, period=14):
-    tr = np.maximum(high[1:].values - low[1:].values,
-                    np.abs(high[1:].values - close[:-1].values),
-                    np.abs(low[1:].values - close[:-1].values))
-    atr = pd.Series(tr).rolling(period).mean()
-    return pd.Series([np.nan]*period + list(atr)).reindex_like(close)
+def _atr(h, l, c, period=14):
+    tr = np.maximum(h.iloc[1:].values - l.iloc[1:].values,
+                    np.abs(h.iloc[1:].values - c.iloc[:-1].values),
+                    np.abs(l.iloc[1:].values - c.iloc[:-1].values))
+    return pd.Series(np.r_[np.full(period, np.nan), pd.Series(tr).rolling(period).mean()], index=c.index)
 
-# -------------------- Main --------------------
-
+# ───────────────────────── MAIN ─────────────────────────
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    collector = CryptoDataCollector()
+    collector = CryptoCollector()
     collector.start()
     while True:
         time.sleep(1)
