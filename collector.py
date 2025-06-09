@@ -1,151 +1,100 @@
 """
-Collect real-time Binance data → ClickHouse
+LSTM + LightGBM ensemble → ClickHouse table executed_trades
 """
 
-import json, time, logging, os
-from datetime import datetime
-from collections import deque
+import json, logging, os, pathlib, time
 
 import numpy as np
 import pandas as pd
-from binance import ThreadedWebsocketManager
+import torch, lightgbm as lgb
+from sklearn.preprocessing import RobustScaler
 from clickhouse_connect import get_client
 
 
-# ──────────────────────── CONFIG ────────────────────────
-API_KEY    = os.getenv("BINANCE_API_KEY")
-API_SECRET = os.getenv("BINANCE_API_SECRET")
-if not (API_KEY and API_SECRET):
-    raise RuntimeError("Missing BINANCE_API_KEY / BINANCE_API_SECRET")
-
-SYMBOL   = "ethusdt"
-INTERVAL = "1m"
-
-CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST", "clickhouse")
-CLICKHOUSE_PORT = int(os.getenv("CLICKHOUSE_PORT", 8123))
-CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", "default")
-CLICKHOUSE_PASS = os.getenv("CLICKHOUSE_PASSWORD", "")
-
-ck = get_client(
-    host=CLICKHOUSE_HOST,
-    port=CLICKHOUSE_PORT,
-    username=CLICKHOUSE_USER,
-    password=CLICKHOUSE_PASS,
+# ───────── CONFIG ─────────
+CLICKHOUSE = dict(
+    host=os.getenv("CLICKHOUSE_HOST", "clickhouse"),
+    username=os.getenv("CLICKHOUSE_USER", "default"),
+    password=os.getenv("CLICKHOUSE_PASSWORD", ""),
     compress=True,
 )
 
-# ──────────────────────── COLLECTOR ─────────────────────
-class CryptoCollector:
-    def __init__(self, symbol=SYMBOL, interval=INTERVAL):
-        self.symbol      = symbol.lower()
-        self.interval    = interval
-        self.order_book  = {"bids": [], "asks": []}
-        self.trades      = deque(maxlen=500)
-        self.kline_data  = pd.DataFrame()
-        self.features    = {}
-        self.twm         = ThreadedWebsocketManager(API_KEY, API_SECRET)
+SYMBOL           = "ETHUSDT"
+LOOKBACK         = 20
+SLEEP_SEC        = 60
+LSTM_WEIGHTS     = pathlib.Path("models/lstm_model.pth")
+LGBM_FILE        = pathlib.Path("models/lightgbm_model.txt")
 
-    # ───────── WS START
-    def start(self):
-        self.twm.start()
-        self.twm.start_depth_socket(symbol=self.symbol,  callback=self.on_depth)
-        self.twm.start_trade_socket(symbol=self.symbol,  callback=self.on_trade)
-        self.twm.start_kline_socket(symbol=self.symbol, interval=self.interval, callback=self.on_kline)
+ck = get_client(**CLICKHOUSE)
 
-    # ───────── handlers
-    def on_depth(self, msg: dict):
-        # Binance depth stream uses keys 'b' (bids) and 'a' (asks)
-        self.order_book["bids"] = [(float(p), float(q)) for p, q in msg["b"]]
-        self.order_book["asks"] = [(float(p), float(q)) for p, q in msg["a"]]
-        self._ob_features()
+# auto-DDL
+ck.command("""
+CREATE TABLE IF NOT EXISTS executed_trades (
+    ts      DateTime,
+    symbol  String,
+    signal  Int8,
+    score   Float32
+) ENGINE = MergeTree ORDER BY (symbol, ts)
+""")
 
-    def on_trade(self, msg: dict):
-        self.trades.append(
-            {
-                "price": float(msg["p"]),
-                "qty":   float(msg["q"]),
-                "time":  msg["T"],
-                "is_buyer_maker": msg["m"],
-            }
-        )
+ck.command("""
+CREATE TABLE IF NOT EXISTS futures_features (
+    ts        DateTime,
+    symbol    String,
+    features  JSON,
+    raw_data  JSON
+) ENGINE = MergeTree ORDER BY (symbol, ts)
+""")
 
-    def on_kline(self, msg: dict):
-        k = msg["k"]
-        if not k["x"]:        # candle not closed yet
-            return
-        row = {
-            "ts":     datetime.utcfromtimestamp(k["t"] / 1000),
-            "open":   float(k["o"]),
-            "high":   float(k["h"]),
-            "low":    float(k["l"]),
-            "close":  float(k["c"]),
-            "volume": float(k["v"]),
-        }
-        self.kline_data = pd.concat([self.kline_data, pd.DataFrame([row])], ignore_index=True).tail(500)
-        self._tech_indicators()
-        self._push_clickhouse()
+# ───────── models & scaler ─────────
+def last_n_features(n=LOOKBACK):
+    rows = ck.query(
+        f"SELECT features FROM futures_features "
+        f"WHERE symbol='{SYMBOL}' ORDER BY ts DESC LIMIT {n}"
+    ).result_rows[::-1]
+    return None if len(rows)<n else pd.DataFrame([json.loads(r[0]) for r in rows])
 
-    # ───────── feature calculators
-    def _ob_features(self):
-        bids, asks = self.order_book["bids"], self.order_book["asks"]
-        if not (bids and asks):
-            return
-        bid_vol, ask_vol = (sum(q for _, q in bids), sum(q for _, q in asks))
-        self.features.update(
-            ob_imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol + 1e-8),
-            spread       = asks[0][0] - bids[0][0],
-        )
+probe = last_n_features(1)
+if probe is None:
+    logging.error("No feature rows yet; model loop exits.")
+    exit(1)
 
-    def _tech_indicators(self):
-        if len(self.kline_data) < 20:
-            return
-        df = self.kline_data
-        df["ema_10"] = df["close"].ewm(span=10).mean()
-        df["rsi"]    = _rsi(df["close"])
-        df["atr"]    = _atr(df["high"], df["low"], df["close"])
-        last = df.iloc[-1]
-        self.features.update(ema_10=last.ema_10, rsi=last.rsi, atr=last.atr)
+INPUT_DIM = probe.shape[1]
+scaler = RobustScaler().fit(probe)
 
-    # ───────── ClickHouse insert
-    def _push_clickhouse(self):
-        row = {
-            "ts": datetime.utcnow(),
-            "symbol": SYMBOL.upper(),
-            "features": json.dumps(self.features),
-            "raw_data": json.dumps(
-                {
-                    "order_book": self.order_book,
-                    "trades":     list(self.trades)[-20:],
-                    "kline":      self.kline_data.iloc[-1].to_dict(),
-                },
-                default=str,           # serialize Timestamp
-            ),
-        }
-        try:
-            ck.insert(
-                "INSERT INTO futures_features (ts, symbol, features, raw_data) VALUES",
-                [row],
-            )
-        except Exception as e:
-            logging.error(f"ClickHouse insert failed: {e!s}")
+class LSTM(torch.nn.Module):
+    def __init__(self, d): super().__init__()
+    def __init__(self, d):
+        super().__init__()
+        self.lstm=torch.nn.LSTM(d,32,batch_first=True)
+        self.fc=torch.nn.Linear(32,1)
+    def forward(self,x):
+        return self.fc(self.lstm(x)[0][:,-1])
 
-# ─────────────────── helper indicators ──────────────────
-def _rsi(series, period=14):
-    delta = series.diff()
-    up, down = delta.clip(lower=0), -delta.clip(upper=0)
-    ma_up, ma_down = up.rolling(period).mean(), down.rolling(period).mean()
-    return 100 - 100 / (1 + ma_up / (ma_down + 1e-8))
+lstm=LSTM(INPUT_DIM)
+if LSTM_WEIGHTS.exists():
+    lstm.load_state_dict(torch.load(LSTM_WEIGHTS,map_location="cpu"))
+    logging.info("LSTM weights loaded")
+else:
+    logging.warning("No LSTM weights; random init")
 
-def _atr(h, l, c, period=14):
-    tr = np.maximum(h.iloc[1:].values - l.iloc[1:].values,
-                    np.abs(h.iloc[1:].values - c.iloc[:-1].values),
-                    np.abs(l.iloc[1:].values - c.iloc[:-1].values))
-    return pd.Series(np.r_[np.full(period, np.nan), pd.Series(tr).rolling(period).mean()], index=c.index)
+lstm.eval()
+lgbm = lgb.Booster(model_file=str(LGBM_FILE)) if LGBM_FILE.exists() else None
 
-# ───────────────────────── MAIN ─────────────────────────
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    collector = CryptoCollector()
-    collector.start()
-    while True:
-        time.sleep(1)
+# ───────── main loop ─────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
+while True:
+    try:
+        df = last_n_features()
+        if df is not None:
+            x_seq = scaler.transform(df).reshape(1,LOOKBACK,-1)
+            lstm_prob = torch.sigmoid(lstm(torch.tensor(x_seq, dtype=torch.float32))).item()
+            lgb_prob  = lgbm.predict(x_seq[:,-1]) [0] if lgbm else 0.5
+            score = 0.6*lstm_prob + 0.4*lgb_prob
+            signal = 1 if score>0.6 else -1 if score<0.4 else 0
+            ck.insert("executed_trades",[dict(ts=pd.Timestamp.utcnow(),
+                                              symbol=SYMBOL,signal=signal,score=score)])
+            logging.info(f"signal {signal:+d}  score {score:0.4f}")
+    except Exception as e:
+        logging.exception(e)
+    time.sleep(SLEEP_SEC)
