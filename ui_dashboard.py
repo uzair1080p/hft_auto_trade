@@ -10,7 +10,7 @@ import os
 CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST", "clickhouse")
 CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", "default")
 CLICKHOUSE_PASS = os.getenv("CLICKHOUSE_PASSWORD", "")
-CLICKHOUSE_PORT=int(os.getenv("CLICKHOUSE_PORT", 8123)),
+CLICKHOUSE_PORT=int(os.getenv("CLICKHOUSE_PORT", 8123))
 
 client = get_client(
     host=CLICKHOUSE_HOST,

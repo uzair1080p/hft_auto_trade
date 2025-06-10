@@ -110,10 +110,10 @@ class Collector:
     def run(self):
         loop = self.bsm._loop
         loop.create_task(
-            self.bsm.start_socket(self.on_depth, f"{SYMBOL_LC}@depth")
+            self.bsm.start_depth_socket(symbol=SYMBOL_LC, callback=self.on_depth)
         )
         loop.create_task(
-            self.bsm.start_kline_socket(self.on_kline, SYMBOL_UC, interval=INTERVAL)
+            self.bsm.start_kline_socket(symbol=SYMBOL_UC, interval=INTERVAL, callback=self.on_kline)
         )
         self.bsm.start()
 
