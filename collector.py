@@ -1,100 +1,123 @@
 """
-LSTM + LightGBM ensemble → ClickHouse table executed_trades
+Real-time collector:
+  • depth   → order-book imbalance, spread
+  • kline   → EMA-10, RSI-14, ATR-14
+Stores one JSON feature row per closed 1-minute candle.
 """
 
-import json, logging, os, pathlib, time
+import json, os, time, logging
+from datetime import datetime
+from collections import deque
 
 import numpy as np
 import pandas as pd
-import torch, lightgbm as lgb
-from sklearn.preprocessing import RobustScaler
+from binance import Client, BinanceSocketManager
 from clickhouse_connect import get_client
 
+# ───── CONFIG ─────
+API_KEY    = os.getenv("BINANCE_API_KEY")
+API_SECRET = os.getenv("BINANCE_API_SECRET")
+SYMBOL_UC  = "ETHUSDT"           # upper-case for kline stream
+SYMBOL_LC  = SYMBOL_UC.lower()   # lower-case for depth stream
+INTERVAL   = "1m"
 
-# ───────── CONFIG ─────────
-CLICKHOUSE = dict(
+ck = get_client(
     host=os.getenv("CLICKHOUSE_HOST", "clickhouse"),
     username=os.getenv("CLICKHOUSE_USER", "default"),
     password=os.getenv("CLICKHOUSE_PASSWORD", ""),
     compress=True,
 )
 
-SYMBOL           = "ETHUSDT"
-LOOKBACK         = 20
-SLEEP_SEC        = 60
-LSTM_WEIGHTS     = pathlib.Path("models/lstm_model.pth")
-LGBM_FILE        = pathlib.Path("models/lightgbm_model.txt")
-
-ck = get_client(**CLICKHOUSE)
-
-# auto-DDL
-ck.command("""
-CREATE TABLE IF NOT EXISTS executed_trades (
-    ts      DateTime,
-    symbol  String,
-    signal  Int8,
-    score   Float32
-) ENGINE = MergeTree ORDER BY (symbol, ts)
-""")
-
 ck.command("""
 CREATE TABLE IF NOT EXISTS futures_features (
-    ts        DateTime,
-    symbol    String,
-    features  JSON,
-    raw_data  JSON
+    ts DateTime,
+    symbol String,
+    features JSON,
+    raw_data JSON
 ) ENGINE = MergeTree ORDER BY (symbol, ts)
 """)
 
-# ───────── models & scaler ─────────
-def last_n_features(n=LOOKBACK):
-    rows = ck.query(
-        f"SELECT features FROM futures_features "
-        f"WHERE symbol='{SYMBOL}' ORDER BY ts DESC LIMIT {n}"
-    ).result_rows[::-1]
-    return None if len(rows)<n else pd.DataFrame([json.loads(r[0]) for r in rows])
+# ───── indicators ─────
+def rsi(series, p=14):
+    delta = series.diff()
+    up, dn = delta.clip(lower=0), -delta.clip(upper=0)
+    return 100 - 100 / (1 + up.rolling(p).mean() / (dn.rolling(p).mean() + 1e-8))
 
-probe = last_n_features(1)
-if probe is None:
-    logging.error("No feature rows yet; model loop exits.")
-    exit(1)
+def atr(h,l,c,p=14):
+    tr = np.maximum(h[1:].values-l[1:].values,
+                    np.abs(h[1:].values-c[:-1].values),
+                    np.abs(l[1:].values-c[:-1].values))
+    return pd.Series(np.r_[np.full(p,np.nan), pd.Series(tr).rolling(p).mean()],
+                     index=c.index)
 
-INPUT_DIM = probe.shape[1]
-scaler = RobustScaler().fit(probe)
+# ───── collector class ─────
+class Collector:
+    def __init__(self):
+        self.order_book = {"bids": [], "asks": []}
+        self.kline_df   = pd.DataFrame()
+        self.features   = {}
+        self.clt        = Client(API_KEY, API_SECRET)
+        self.bsm        = BinanceSocketManager(self.clt)
 
-class LSTM(torch.nn.Module):
-    def __init__(self, d): super().__init__()
-    def __init__(self, d):
-        super().__init__()
-        self.lstm=torch.nn.LSTM(d,32,batch_first=True)
-        self.fc=torch.nn.Linear(32,1)
-    def forward(self,x):
-        return self.fc(self.lstm(x)[0][:,-1])
+    async def on_depth(self, msg):
+        self.order_book["bids"] = [(float(p), float(q)) for p,q in msg["b"]]
+        self.order_book["asks"] = [(float(p), float(q)) for p,q in msg["a"]]
+        bids, asks = self.order_book["bids"], self.order_book["asks"]
+        if bids and asks:
+            bv, av = sum(q for _,q in bids), sum(q for _,q in asks)
+            self.features.update(
+                ob_imbalance=(bv-av)/(bv+av+1e-8),
+                spread      =asks[0][0]-bids[0][0],
+            )
 
-lstm=LSTM(INPUT_DIM)
-if LSTM_WEIGHTS.exists():
-    lstm.load_state_dict(torch.load(LSTM_WEIGHTS,map_location="cpu"))
-    logging.info("LSTM weights loaded")
-else:
-    logging.warning("No LSTM weights; random init")
+    async def on_kline(self, msg):
+        k = msg["k"]
+        if not k["x"]:                          # only closed candles
+            return
+        row = dict(
+            ts=datetime.utcfromtimestamp(k["t"]/1000),
+            open=float(k["o"]), high=float(k["h"]),
+            low=float(k["l"]),  close=float(k["c"]),
+            volume=float(k["v"]),
+        )
+        self.kline_df = pd.concat([self.kline_df,
+                                   pd.DataFrame([row])]).tail(500)
+        if len(self.kline_df) >= 5:             # warm-up shortened
+            df = self.kline_df
+            df["ema10"] = df["close"].ewm(span=10).mean()
+            df["rsi"]   = rsi(df["close"])
+            df["atr"]   = atr(df["high"], df["low"], df["close"])
+            last        = df.iloc[-1]
+            self.features.update(
+                ema10=last.ema10,
+                rsi  =last.rsi,
+                atr  =last.atr,
+            )
+            ck.insert(
+                "futures_features",
+                [{
+                    "ts": datetime.utcnow(),
+                    "symbol": SYMBOL_UC,
+                    "features": json.dumps(self.features),
+                    "raw_data": json.dumps(
+                        {"order_book": self.order_book,
+                         "kline": row},
+                        default=str),
+                }],
+            )
+            logging.info("Inserted features row")
 
-lstm.eval()
-lgbm = lgb.Booster(model_file=str(LGBM_FILE)) if LGBM_FILE.exists() else None
+    def run(self):
+        loop = self.bsm._loop
+        loop.create_task(
+            self.bsm.start_socket(self.on_depth, f"{SYMBOL_LC}@depth")
+        )
+        loop.create_task(
+            self.bsm.start_kline_socket(self.on_kline, SYMBOL_UC, interval=INTERVAL)
+        )
+        self.bsm.start()
 
-# ───────── main loop ─────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-while True:
-    try:
-        df = last_n_features()
-        if df is not None:
-            x_seq = scaler.transform(df).reshape(1,LOOKBACK,-1)
-            lstm_prob = torch.sigmoid(lstm(torch.tensor(x_seq, dtype=torch.float32))).item()
-            lgb_prob  = lgbm.predict(x_seq[:,-1]) [0] if lgbm else 0.5
-            score = 0.6*lstm_prob + 0.4*lgb_prob
-            signal = 1 if score>0.6 else -1 if score<0.4 else 0
-            ck.insert("executed_trades",[dict(ts=pd.Timestamp.utcnow(),
-                                              symbol=SYMBOL,signal=signal,score=score)])
-            logging.info(f"signal {signal:+d}  score {score:0.4f}")
-    except Exception as e:
-        logging.exception(e)
-    time.sleep(SLEEP_SEC)
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s | %(levelname)s | %(message)s")
+    Collector().run()
