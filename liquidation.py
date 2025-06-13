@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from collections import deque
 from typing import Deque, Tuple
 from clickhouse_connect import get_client
-
+import socket, time, os, sys
 # ───────────────────── CONFIG ─────────────────────
 SYMBOL = "ethusdt"                     # endpoint expects lower-case
 
@@ -21,6 +21,23 @@ CLICKHOUSE = dict(
 )
 
 ck = get_client(**CLICKHOUSE)
+
+
+def wait_clickhouse(host="clickhouse", port=8123, timeout=90):
+    print(f"⏳ waiting for ClickHouse {host}:{port} …")
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            with socket.create_connection((host, port), 2):
+                print("✅ ClickHouse is up"); return
+        except OSError:
+            time.sleep(2)
+    sys.exit("❌ ClickHouse not reachable after 90 s")
+
+wait_clickhouse(
+    host=os.getenv("CLICKHOUSE_HOST", "clickhouse"),
+    port=int(os.getenv("CLICKHOUSE_PORT", 8123)),
+)
 
 # idempotent DDL
 ck.command("""
