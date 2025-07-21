@@ -148,11 +148,15 @@ def compute_rsi(series, period=14):
     return rsi
 
 def compute_atr(high, low, close, period=14):
-    tr = np.maximum(high[1:].values - low[1:].values,
-                    np.abs(high[1:].values - close[:-1].values),
-                    np.abs(low[1:].values - close[:-1].values))
+    """Average True Range indicator."""
+    tr_components = [
+        high[1:].values - low[1:].values,
+        np.abs(high[1:].values - close[:-1].values),
+        np.abs(low[1:].values - close[:-1].values),
+    ]
+    tr = np.maximum.reduce(tr_components)
     atr = pd.Series(tr).rolling(period).mean()
-    return pd.Series([np.nan]*period + list(atr)).reindex_like(close)
+    return pd.Series([np.nan] * 1 + atr.tolist()).reindex_like(close)
 
 # -------------------- Main --------------------
 
