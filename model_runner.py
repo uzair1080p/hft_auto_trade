@@ -60,13 +60,37 @@ def load_latest_features():
         return None
     return pd.DataFrame([json.loads(r[1]) for r in rows])
 
+def _heuristic_score(df: pd.DataFrame) -> float:
+    """Compute a heuristic probability based on recent feature values."""
+    last = df.iloc[-1]
+    ob = last.get("ob_imbalance", 0.0)
+    rsi = last.get("rsi", 50.0)
+    spread = last.get("spread", 0.0)
+    atr = last.get("atr", 0.0)
+
+    ob_component = np.tanh(ob * 5)
+    rsi_component = np.tanh((50 - rsi) / 20)
+    spread_component = -np.tanh(spread * 10)
+    atr_component = -np.tanh(atr)
+
+    score = (
+        0.4 * ob_component
+        + 0.3 * rsi_component
+        + 0.2 * spread_component
+        + 0.1 * atr_component
+    )
+    return (score + 1) / 2
+
+
 def predict_trade_signal(lstm_model, lgb_model, scaler, features):
     normed = scaler.transform(features)
     x_seq = torch.tensor(normed.reshape(1, LOOKBACK, -1), dtype=torch.float32)
     with torch.no_grad():
         lstm_out = torch.sigmoid(lstm_model(x_seq)).item()
     lgb_out = lgb_model.predict(normed[-1:].reshape(1, -1))[0]
-    final_score = 0.6 * lstm_out + 0.4 * lgb_out
+    ml_score = 0.6 * lstm_out + 0.4 * lgb_out
+    heur_score = _heuristic_score(features)
+    final_score = 0.7 * ml_score + 0.3 * heur_score
     return 1 if final_score > 0.6 else -1 if final_score < 0.4 else 0, final_score
 
 def log_trade_decision(ts, signal, score):
