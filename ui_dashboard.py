@@ -31,6 +31,17 @@ def get_signals():
     df['ts'] = pd.to_datetime(df['ts'])
     return df.sort_values('ts')
 
+def get_trade_executions():
+    q = """
+    SELECT ts, symbol, signal, score, executed, price, position_size 
+    FROM trade_executions
+    ORDER BY ts DESC LIMIT 500
+    """
+    rows = client.query(q).result_rows
+    df = pd.DataFrame(rows, columns=['ts', 'symbol', 'signal', 'score', 'executed', 'price', 'position_size'])
+    df['ts'] = pd.to_datetime(df['ts'])
+    return df.sort_values('ts')
+
 def get_liquidation():
     q = """
     SELECT timestamp, symbol, liquidation_cluster_size, liquidation_imbalance FROM liquidation_features
@@ -105,6 +116,24 @@ with col1:
     st.subheader("Signal Scores")
     fig2 = px.line(df_signals, x='ts', y='score', color='symbol')
     st.plotly_chart(fig2, use_container_width=True)
+
+    st.subheader("Real Trade Executions")
+    df_executions = get_trade_executions()
+    if not df_executions.empty:
+        fig_exec = px.scatter(df_executions, x='ts', y='price', color='executed', 
+                             size='position_size', title='Trade Executions')
+        st.plotly_chart(fig_exec, use_container_width=True)
+        
+        # Show execution statistics
+        total_signals = len(df_executions)
+        executed_trades = len(df_executions[df_executions['executed'] == 1])
+        execution_rate = (executed_trades / total_signals * 100) if total_signals > 0 else 0
+        
+        st.metric("Execution Rate", f"{execution_rate:.1f}%")
+        st.metric("Total Signals", total_signals)
+        st.metric("Executed Trades", executed_trades)
+    else:
+        st.info("No trade executions recorded yet.")
 
 with col2:
     st.subheader("Liquidation Clusters")
