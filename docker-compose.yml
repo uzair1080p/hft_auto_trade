@@ -5,6 +5,11 @@ services:
     image: confluentinc/cp-zookeeper:7.3.0
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   kafka:
     image: confluentinc/cp-kafka:7.3.0
@@ -16,7 +21,13 @@ services:
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   clickhouse:
     image: clickhouse/clickhouse-server:latest
@@ -26,10 +37,17 @@ services:
       - "9000:9000"  # Native
     volumes:
       - clickhouse_data:/var/lib/clickhouse
+      - ./setup_tables.sql:/docker-entrypoint-initdb.d/setup_tables.sql
     ulimits:
       nofile:
         soft: 262144
         hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   hft_app:
     build:
@@ -39,11 +57,17 @@ services:
     volumes:
       - .:/app
     depends_on:
-      - kafka
-      - clickhouse
+      clickhouse:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
     command: ["bash", "entrypoint.sh"]
     environment:
       - PYTHONUNBUFFERED=1
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASS=
+    restart: unless-stopped
 
   streamlit_ui:
     build:
@@ -54,9 +78,15 @@ services:
       - "8501:8501"
     volumes:
       - .:/app
-    command: ["streamlit", "run", "hft_trading_system.py"]
+    command: ["streamlit", "run", "ui_dashboard_fixed.py", "--server.port=8501", "--server.address=0.0.0.0"]
     depends_on:
-      - clickhouse
+      clickhouse:
+        condition: service_healthy
+    environment:
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASS=
+    restart: unless-stopped
 
 volumes:
   clickhouse_data:

@@ -16,14 +16,10 @@ from clickhouse_connect import get_client
 
 # -------------------- Config --------------------
 
-API_KEY = 'YOUR_BINANCE_API_KEY'
-API_SECRET = 'YOUR_BINANCE_SECRET_KEY'
-SYMBOL = 'ETHUSDT'
-INTERVAL = '1m'
-
-CLICKHOUSE_HOST = 'clickhouse'
-CLICKHOUSE_USER = 'default'
-CLICKHOUSE_PASS = ''
+from config import (
+    BINANCE_API_KEY, BINANCE_API_SECRET, SYMBOL, INTERVAL,
+    CLICKHOUSE_HOST, CLICKHOUSE_USER, CLICKHOUSE_PASS
+)
 
 # -------------------- ClickHouse Client --------------------
 
@@ -44,7 +40,7 @@ class CryptoDataCollector:
         self.trade_data = []
         self.kline_data = pd.DataFrame()
         self.features = {}
-        self.twm = ThreadedWebsocketManager(API_KEY, API_SECRET)
+        self.twm = ThreadedWebsocketManager(BINANCE_API_KEY, BINANCE_API_SECRET)
 
     def start(self):
         self.twm.start()
@@ -161,8 +157,30 @@ def compute_atr(high, low, close, period=14):
 # -------------------- Main --------------------
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    collector = CryptoDataCollector()
-    collector.start()
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s | %(levelname)s | %(message)s'
+    )
+    
+    # Wait for ClickHouse to be ready
     while True:
-        time.sleep(1)
+        try:
+            clickhouse_client.ping()
+            logging.info("✅ ClickHouse connection established")
+            break
+        except Exception as e:
+            logging.warning(f"⏳ Waiting for ClickHouse: {e}")
+            time.sleep(5)
+    
+    try:
+        collector = CryptoDataCollector()
+        collector.start()
+        logging.info("🚀 Data collector started successfully")
+        
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logging.info("👋 Collector stopped by user")
+    except Exception as e:
+        logging.error(f"❌ Collector error: {e}")
+        raise
