@@ -37,7 +37,7 @@ MARGIN_TYPE = 'ISOLATED'
 # Position sizing
 POSITION_SIZE_PCT = 0.02  # 2% of account per trade (1 USDT with 50 USDT balance)
 MAX_POSITION_SIZE_PCT = 0.1  # Maximum 10% of account
-MIN_POSITION_SIZE_USDT = 1   # Lower minimum for DOGEUSDT (1 USDT minimum)
+MIN_POSITION_SIZE_USDT = 0.5   # Lower minimum for DOGEUSDT (0.5 USDT minimum)
 
 # Stop loss and take profit
 STOP_LOSS_PCT = 0.02  # 2% stop loss
