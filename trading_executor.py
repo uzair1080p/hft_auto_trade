@@ -8,6 +8,7 @@ Executes trades based on signals from model_runner.py with proper risk managemen
 import time
 import json
 import logging
+import os
 import pandas as pd
 from datetime import datetime, timedelta
 from binance import Client
@@ -23,6 +24,8 @@ from config import (
     CLICKHOUSE_HOST, CLICKHOUSE_USER, CLICKHOUSE_PASS, SIGNAL_CHECK_INTERVAL
 )
 from risk_manager import RiskManager
+
+DRY_RUN = os.getenv('DRY_RUN', '0') == '1'
 
 # -------------------- Clients --------------------
 
@@ -47,6 +50,9 @@ class TradingExecutor:
         
     def setup_futures_account(self):
         """Initialize futures account settings."""
+        if DRY_RUN:
+            logging.info("[DRY_RUN] Skipping futures account setup")
+            return
         try:
             # Set leverage
             binance_client.futures_change_leverage(symbol=self.symbol, leverage=self.leverage)
@@ -66,6 +72,8 @@ class TradingExecutor:
     
     def get_account_balance(self):
         """Get USDT balance from futures account."""
+        if DRY_RUN:
+            return 1000.0
         try:
             account = binance_client.futures_account()
             for balance in account['assets']:
@@ -78,6 +86,8 @@ class TradingExecutor:
     
     def get_current_position(self):
         """Get current position for the symbol."""
+        if DRY_RUN:
+            return None
         try:
             positions = binance_client.futures_position_information(symbol=self.symbol)
             for position in positions:
@@ -97,6 +107,25 @@ class TradingExecutor:
     
     def get_market_price(self):
         """Get current market price."""
+        if DRY_RUN:
+            try:
+                # Attempt to infer last close price from features raw_data
+                q = f"""
+                SELECT raw_data FROM futures_features
+                WHERE symbol = '{self.symbol}'
+                ORDER BY ts DESC LIMIT 1
+                """
+                res = clickhouse_client.query(q)
+                if res.result_rows:
+                    raw = json.loads(res.result_rows[0][0])
+                    kline = raw.get('kline') or {}
+                    close = kline.get('close')
+                    if close:
+                        return float(close)
+            except Exception:
+                pass
+            # Fallback synthetic price
+            return 2000.0
         try:
             ticker = binance_client.futures_symbol_ticker(symbol=self.symbol)
             return float(ticker['price'])
@@ -124,6 +153,8 @@ class TradingExecutor:
     
     def get_quantity_precision(self):
         """Get quantity precision for the symbol."""
+        if DRY_RUN:
+            return 3
         try:
             exchange_info = binance_client.futures_exchange_info()
             for symbol_info in exchange_info['symbols']:
@@ -140,6 +171,9 @@ class TradingExecutor:
     
     def place_market_order(self, side, quantity):
         """Place a market order."""
+        if DRY_RUN:
+            logging.info(f"[DRY_RUN] Would place {side} MARKET {quantity} {self.symbol}")
+            return {'orderId': 'dry-run'}
         try:
             order = binance_client.futures_create_order(
                 symbol=self.symbol,
@@ -155,6 +189,9 @@ class TradingExecutor:
     
     def place_stop_loss_order(self, side, quantity, price):
         """Place a stop loss order."""
+        if DRY_RUN:
+            logging.info(f"[DRY_RUN] Would place STOP {('SELL' if side=='BUY' else 'BUY')} {quantity} @ {price}")
+            return {'orderId': 'dry-run-sl'}
         try:
             stop_side = 'SELL' if side == 'BUY' else 'BUY'
             order = binance_client.futures_create_order(
@@ -172,6 +209,9 @@ class TradingExecutor:
     
     def place_take_profit_order(self, side, quantity, price):
         """Place a take profit order."""
+        if DRY_RUN:
+            logging.info(f"[DRY_RUN] Would place TAKE_PROFIT {('SELL' if side=='BUY' else 'BUY')} {quantity} @ {price}")
+            return {'orderId': 'dry-run-tp'}
         try:
             tp_side = 'SELL' if side == 'BUY' else 'BUY'
             order = binance_client.futures_create_order(
@@ -277,8 +317,9 @@ class TradingExecutor:
                 'position_size': self.calculate_position_size(price) if executed else 0.0
             }
             clickhouse_client.insert(
-                "INSERT INTO trade_executions (ts, symbol, signal, score, executed, price, position_size) VALUES",
-                [row]
+                'trade_executions',
+                [[row['ts'], row['symbol'], row['signal'], row['score'], 1 if row['executed'] else 0, row['price'], row['position_size']]],
+                column_names=['ts','symbol','signal','score','executed','price','position_size']
             )
             logging.info(f"Logged trade execution: signal={signal}, executed={executed}, price={price}")
         except Exception as e:
@@ -291,6 +332,8 @@ def main():
     executor = TradingExecutor()
     
     logging.info("Trading executor started. Waiting for signals...")
+    if DRY_RUN:
+        logging.info("[DRY_RUN] Executor is running in dry-run mode. No real orders will be placed.")
     
     while True:
         try:

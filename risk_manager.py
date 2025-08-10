@@ -7,6 +7,7 @@ Provides position monitoring, drawdown tracking, and safety checks.
 
 import time
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple
 from binance import Client
@@ -16,6 +17,8 @@ from config import (
     MAX_DAILY_LOSS_PCT, MAX_DRAWDOWN_PCT, MIN_POSITION_SIZE_USDT,
     CLICKHOUSE_HOST, CLICKHOUSE_USER, CLICKHOUSE_PASS
 )
+
+DRY_RUN = os.getenv('DRY_RUN', '0') == '1'
 
 # -------------------- Clients --------------------
 
@@ -40,6 +43,15 @@ class RiskManager:
         
     def initialize_daily_tracking(self):
         """Initialize daily PnL tracking."""
+        if DRY_RUN:
+            current_date = datetime.utcnow().date()
+            if self.last_reset_date != current_date:
+                self.daily_start_balance = 1000.0
+                self.peak_balance = 1000.0
+                self.daily_pnl = 0.0
+                self.last_reset_date = current_date
+                logging.info("[DRY_RUN] Initialized daily tracking with synthetic balance: 1000.0")
+            return
         try:
             account = binance_client.futures_account()
             total_balance = float(account['totalWalletBalance'])
@@ -58,6 +70,8 @@ class RiskManager:
     
     def get_account_balance(self) -> float:
         """Get current account balance."""
+        if DRY_RUN:
+            return 1000.0
         try:
             account = binance_client.futures_account()
             return float(account['totalWalletBalance'])
@@ -69,13 +83,19 @@ class RiskManager:
         """Update daily PnL tracking."""
         try:
             current_balance = self.get_account_balance()
+            if self.daily_start_balance == 0:
+                self.daily_start_balance = current_balance
+                self.peak_balance = current_balance
             self.daily_pnl = current_balance - self.daily_start_balance
             
             # Update peak balance and drawdown
             if current_balance > self.peak_balance:
                 self.peak_balance = current_balance
             
-            current_drawdown = (self.peak_balance - current_balance) / self.peak_balance
+            if self.peak_balance > 0:
+                current_drawdown = (self.peak_balance - current_balance) / self.peak_balance
+            else:
+                current_drawdown = 0.0
             if current_drawdown > self.max_drawdown:
                 self.max_drawdown = current_drawdown
                 
@@ -100,6 +120,14 @@ class RiskManager:
     
     def get_position_risk_metrics(self) -> Dict:
         """Get current position risk metrics."""
+        if DRY_RUN:
+            account_balance = self.get_account_balance()
+            return {
+                'total_exposure_usdt': 0.0,
+                'exposure_pct': 0.0,
+                'unrealized_pnl': 0.0,
+                'account_balance': account_balance
+            }
         try:
             positions = binance_client.futures_position_information(symbol=SYMBOL)
             total_exposure = 0.0
@@ -152,11 +180,11 @@ class RiskManager:
         
         # Get current risk metrics
         risk_metrics = self.get_position_risk_metrics()
-        if not risk_metrics:
+        if not risk_metrics and not DRY_RUN:
             return False, "Failed to get risk metrics"
         
         # Check exposure limits
-        if risk_metrics['exposure_pct'] > 50:  # Max 50% exposure
+        if risk_metrics and risk_metrics.get('exposure_pct', 0) > 50:  # Max 50% exposure
             return False, f"Exposure too high: {risk_metrics['exposure_pct']:.1f}%"
         
         return True, "Trade allowed"
@@ -164,31 +192,31 @@ class RiskManager:
     def log_risk_check(self, signal: int, allowed: bool, reason: str, position_value: float):
         """Log risk check results."""
         try:
-            risk_metrics = self.get_position_risk_metrics()
-            
-            row = {
-                'ts': datetime.utcnow(),
-                'symbol': SYMBOL,
-                'signal': signal,
-                'allowed': allowed,
-                'reason': reason,
-                'position_value': position_value,
-                'daily_pnl': self.daily_pnl,
-                'max_drawdown': self.max_drawdown,
-                'exposure_pct': risk_metrics.get('exposure_pct', 0),
-                'account_balance': risk_metrics.get('account_balance', 0)
+            risk_metrics = self.get_position_risk_metrics() if not DRY_RUN else {
+                'exposure_pct': 0.0,
+                'account_balance': self.get_account_balance()
             }
-            
+            row = [
+                datetime.utcnow(),
+                SYMBOL,
+                signal,
+                1 if allowed else 0,
+                reason,
+                position_value,
+                self.daily_pnl,
+                self.max_drawdown,
+                risk_metrics.get('exposure_pct', 0.0),
+                risk_metrics.get('account_balance', 0.0)
+            ]
             clickhouse_client.insert(
-                "INSERT INTO risk_checks (ts, symbol, signal, allowed, reason, position_value, daily_pnl, max_drawdown, exposure_pct, account_balance) VALUES",
-                [row]
+                'risk_checks',
+                [row],
+                column_names=['ts','symbol','signal','allowed','reason','position_value','daily_pnl','max_drawdown','exposure_pct','account_balance']
             )
-            
             if not allowed:
                 logging.warning(f"Trade blocked: {reason}")
             else:
                 logging.info(f"Trade allowed: {reason}")
-                
         except Exception as e:
             logging.error(f"Failed to log risk check: {e}")
     

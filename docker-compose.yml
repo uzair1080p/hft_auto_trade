@@ -38,6 +38,9 @@ services:
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       - ./setup_tables.sql:/docker-entrypoint-initdb.d/setup_tables.sql
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: secret
     ulimits:
       nofile:
         soft: 262144
@@ -59,14 +62,18 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
-      kafka:
-        condition: service_healthy
-    command: ["bash", "entrypoint.sh"]
+    entrypoint: []
+    command: ["/bin/bash", "entrypoint.sh"]
     environment:
       - PYTHONUNBUFFERED=1
       - CLICKHOUSE_HOST=clickhouse
       - CLICKHOUSE_USER=default
-      - CLICKHOUSE_PASS=
+      - CLICKHOUSE_PASS=secret
+      - DRY_RUN=0
+      - KAFKA_ENABLED=0
+      - LIQUIDATION_ENABLED=0
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_API_SECRET=${BINANCE_API_SECRET}
     restart: unless-stopped
 
   streamlit_ui:
@@ -78,6 +85,7 @@ services:
       - "8501:8501"
     volumes:
       - .:/app
+    entrypoint: []
     command: ["streamlit", "run", "ui_dashboard_fixed.py", "--server.port=8501", "--server.address=0.0.0.0"]
     depends_on:
       clickhouse:
@@ -85,7 +93,10 @@ services:
     environment:
       - CLICKHOUSE_HOST=clickhouse
       - CLICKHOUSE_USER=default
-      - CLICKHOUSE_PASS=
+      - CLICKHOUSE_PASS=secret
+      - DRY_RUN=1
+      - DASHBOARD_USERNAME=${DASHBOARD_USERNAME:-admin}
+      - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD:-trading123}
     restart: unless-stopped
 
 volumes:

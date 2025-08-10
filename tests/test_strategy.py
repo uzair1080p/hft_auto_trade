@@ -2,6 +2,7 @@
 
 import pytest
 import pandas as pd
+import numpy as np
 from model_runner import predict_trade_signal
 from model_runner import LSTMModel
 import lightgbm as lgb
@@ -32,13 +33,26 @@ def dummy_model():
 
 @pytest.fixture
 def dummy_lgb():
-    return lgb.Booster(model_str="<empty_model>")  # Placeholder
+    # Build a minimal LightGBM booster so prediction works
+    X = np.random.rand(20, 10)
+    y = np.random.rand(20)
+    dtrain = lgb.Dataset(X, label=y)
+    params = {
+        'objective': 'regression',
+        'metric': 'l2',
+        'verbosity': -1,
+        'num_leaves': 8,
+        'min_data_in_leaf': 1,
+    }
+    booster = lgb.train(params, dtrain, num_boost_round=5)
+    return booster
 
 @pytest.fixture
 def dummy_scaler():
     scaler = RobustScaler()
     scaler.fit([[i/10.0]*10 for i in range(1, 21)])
     return scaler
+
 
 def test_signal_range(dummy_model, dummy_lgb, dummy_scaler, dummy_data):
     signal, score = predict_trade_signal(dummy_model, dummy_lgb, dummy_scaler, dummy_data)

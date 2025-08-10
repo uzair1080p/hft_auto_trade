@@ -12,15 +12,16 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from binance import ThreadedWebsocketManager
 from clickhouse_connect import get_client
+import os
 
 # -------------------- Config --------------------
 
-API_KEY = 'YOUR_BINANCE_API_KEY'
-API_SECRET = 'YOUR_BINANCE_SECRET_KEY'
-SYMBOL = 'ethusdt'
-CLICKHOUSE_HOST = 'clickhouse'
-CLICKHOUSE_USER = 'default'
-CLICKHOUSE_PASS = ''
+API_KEY = os.getenv('BINANCE_API_KEY', 'YOUR_BINANCE_API_KEY')
+API_SECRET = os.getenv('BINANCE_API_SECRET', 'YOUR_BINANCE_SECRET_KEY')
+SYMBOL = os.getenv('SYMBOL', 'dogeusdt')
+CLICKHOUSE_HOST = os.getenv('CLICKHOUSE_HOST', 'clickhouse')
+CLICKHOUSE_USER = os.getenv('CLICKHOUSE_USER', 'default')
+CLICKHOUSE_PASS = os.getenv('CLICKHOUSE_PASS', '')
 
 # -------------------- ClickHouse Client --------------------
 
@@ -81,7 +82,7 @@ def main():
         while True:
             time.sleep(30)
             features = proc.get_cluster_features()
-            client.insert("liquidation_features", [features])
+            client.insert("liquidation_events", [features])
             logging.info(f"[{features['timestamp']}] Logged: {features}")
     except KeyboardInterrupt:
         twm.stop()

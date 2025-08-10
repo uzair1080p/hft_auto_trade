@@ -22,7 +22,7 @@ CLICKHOUSE_PASS = os.getenv('CLICKHOUSE_PASS', '')
 # -------------------- Trading Configuration --------------------
 
 # Trading pair
-SYMBOL = 'ETHUSDT'
+SYMBOL = 'DOGEUSDT'  # Much cheaper than ETH, ~$0.07 vs $4,200+
 
 # Time intervals
 INTERVAL = '1m'  # Data collection interval
@@ -35,9 +35,9 @@ MARGIN_TYPE = 'ISOLATED'
 # -------------------- Risk Management --------------------
 
 # Position sizing
-POSITION_SIZE_PCT = 0.02  # 2% of account per trade
+POSITION_SIZE_PCT = 0.02  # 2% of account per trade (1 USDT with 50 USDT balance)
 MAX_POSITION_SIZE_PCT = 0.1  # Maximum 10% of account
-MIN_POSITION_SIZE_USDT = 10  # Minimum position size in USDT
+MIN_POSITION_SIZE_USDT = 1   # Lower minimum for DOGEUSDT (1 USDT minimum)
 
 # Stop loss and take profit
 STOP_LOSS_PCT = 0.02  # 2% stop loss

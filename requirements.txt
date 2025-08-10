@@ -11,3 +11,4 @@ shap
 ta-lib
 backtrader
 python-binance
+plotly
