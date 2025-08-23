@@ -10,16 +10,6 @@ wait_for_clickhouse() {
     echo "✅ ClickHouse is ready!"
 }
 
-# Function to wait for Kafka to be ready
-wait_for_kafka() {
-    echo "⏳ Waiting for Kafka to be ready..."
-    while ! nc -z kafka 9092; do
-        echo "Kafka not ready yet, waiting..."
-        sleep 5
-    done
-    echo "✅ Kafka is ready!"
-}
-
 # Function to initialize database tables
 init_database() {
     echo "🗄️ Initializing database tables..."
@@ -69,18 +59,16 @@ start_component() {
 # Function to monitor and restart components
 monitor_components() {
     local pids=("$@")
-    local names=("Collector" "AI Training" "AI Signal Generator" "Trading Executor" "Liquidation Processor")
+    local names=("HFT Data Collector" "HFT Model Runner" "HFT Trading Executor")
     
     while true; do
         for i in "${!pids[@]}"; do
             if ! kill -0 "${pids[$i]}" 2>/dev/null; then
                 echo "⚠️ ${names[$i]} process died, restarting..."
                 case $i in
-                    0) start_component "Collector" "collector.py" ;;
-                    1) start_component "AI Training System" "ai_training_system.py" ;;
-                    2) start_component "AI Signal Generator" "ai_signal_generator.py" ;;
-                    3) start_component "Trading Executor" "trading_executor.py" ;;
-                    4) start_component "Liquidation Processor" "liquidation.py" ;;
+                    0) start_component "HFT Data Collector" "hft_data_collector.py" ;;
+                    1) start_component "HFT Model Runner" "hft_model_runner.py" ;;
+                    2) start_component "HFT Trading Executor" "hft_trading_executor.py" ;;
                 esac
                 pids[$i]=$!
             fi
@@ -90,42 +78,29 @@ monitor_components() {
 }
 
 # Main startup sequence
-echo "🚀 Starting HFT Trading System..."
+echo "🚀 Starting High-Frequency Trading (HFT) System..."
+echo "⚡ Conservative HFT Mode: 60 trades per hour"
+echo "🔒 Dry Run Mode: ${DRY_RUN:-1}"
 
 # Wait for dependencies
 wait_for_clickhouse
-if [ "${KAFKA_ENABLED:-1}" = "1" ]; then
-  wait_for_kafka
-else
-  echo "⚠️ Kafka disabled via KAFKA_ENABLED=${KAFKA_ENABLED:-0}; skipping Kafka wait"
-fi
 
 # Initialize database
 init_database
 
-# Start components
-start_component "Collector" "collector.py"
+# Start HFT components
+start_component "HFT Data Collector" "hft_data_collector.py"
 collector_pid=$!
 
-start_component "AI Training System" "ai_training_system.py"
-ai_training_pid=$!
+start_component "HFT Model Runner" "hft_model_runner.py"
+model_runner_pid=$!
 
-start_component "AI Signal Generator" "ai_signal_generator.py"
-ai_signal_pid=$!
-
-start_component "Trading Executor" "trading_executor.py"
+start_component "HFT Trading Executor" "hft_trading_executor.py"
 executor_pid=$!
 
-if [ "${LIQUIDATION_ENABLED:-0}" = "1" ]; then
-  start_component "Liquidation Processor" "liquidation.py"
-  liquidation_pid=$!
-else
-  liquidation_pid=0
-  echo "⚠️ Liquidation Processor disabled via LIQUIDATION_ENABLED=${LIQUIDATION_ENABLED:-0}"
-fi
-
-echo "✅ All components started successfully!"
+echo "✅ All HFT components started successfully!"
 echo "📊 Monitoring component health..."
+echo "🔍 Check logs for real-time performance metrics"
 
 # Monitor and restart components if they fail
-monitor_components $collector_pid $ai_training_pid $ai_signal_pid $executor_pid $liquidation_pid
+monitor_components $collector_pid $model_runner_pid $executor_pid

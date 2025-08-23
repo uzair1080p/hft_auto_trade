@@ -29,7 +29,12 @@ DRY_RUN = os.getenv('DRY_RUN', '0') == '1'
 
 # -------------------- Clients --------------------
 
-binance_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+# Initialize Binance client only if not in DRY_RUN mode
+if not DRY_RUN:
+    binance_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+else:
+    binance_client = None
+
 clickhouse_client = get_client(
     host=CLICKHOUSE_HOST,
     username=CLICKHOUSE_USER,
@@ -72,7 +77,7 @@ class TradingExecutor:
     
     def get_account_balance(self):
         """Get USDT balance from futures account."""
-        if DRY_RUN:
+        if DRY_RUN or binance_client is None:
             return 1000.0
         try:
             account = binance_client.futures_account()
@@ -86,7 +91,7 @@ class TradingExecutor:
     
     def get_current_position(self):
         """Get current position for the symbol."""
-        if DRY_RUN:
+        if DRY_RUN or binance_client is None:
             return None
         try:
             positions = binance_client.futures_position_information(symbol=self.symbol)
@@ -107,7 +112,7 @@ class TradingExecutor:
     
     def get_market_price(self):
         """Get current market price."""
-        if DRY_RUN:
+        if DRY_RUN or binance_client is None:
             try:
                 # Attempt to infer last close price from features raw_data
                 q = f"""

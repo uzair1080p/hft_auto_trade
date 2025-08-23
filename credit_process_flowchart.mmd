@@ -1,0 +1,90 @@
+flowchart LR
+  %% Styles
+  classDef team fill:#0ea5e9,stroke:#0369a1,color:#fff,rx:6,ry:6
+  classDef system fill:#10b981,stroke:#065f46,color:#fff,rx:6,ry:6
+  classDef decision fill:#f59e0b,stroke:#b45309,color:#fff,rx:6,ry:6
+  classDef action fill:#6366f1,stroke:#3730a3,color:#fff,rx:6,ry:6
+  classDef notify fill:#a78bfa,stroke:#6d28d9,color:#fff,rx:6,ry:6
+  classDef challenge fill:#fee2e2,stroke:#ef4444,color:#991b1b,stroke-dasharray: 5 5,rx:6,ry:6
+
+  %% 1. Credit Risk Team
+  A["🛡️ 1) Credit Risk Team"]:::team --> A1["🧾 Shares checklist of required documents with Sales nationwide"]:::action
+
+  %% 2. Sales Team via CRM
+  subgraph STAGE2["2) Sales Team (via CRM/Sales Platform)"]
+    direction LR
+    B["🧑‍💼 Capture client info + upload documents"]:::system --> C{"🧮 Score card evaluates"}:::decision
+    C -->|Stage 1| C1["💰 Super High profit margin"]:::decision
+    C -->|Stage 2| C2["📈 High profit margin\n(RGM approval)"]:::decision
+    C -->|Stage 3| C3["⚖️ Medium profit margin\n(RGM + Credit Risk approval)"]:::decision
+    C -->|Stage 4| C4["📝 Low profit margin\n(Credit Risk + CFO + CEO approval, with justification)"]:::decision
+  end
+
+  A1 --> STAGE2
+
+  %% 3. Existing clients linkage
+  subgraph EXIST["3) For Existing Clients"]
+    direction LR
+    D["🔗 Proposal linked to receivables ageing\n(based on DPD & DSO)"]:::system
+  end
+
+  STAGE2 --> EXIST
+
+  %% 4. Files to Credit Risk
+  subgraph SEND["4) Credit Files Sent to Credit Risk Team"]
+    direction LR
+    E["📤 Send credit files"]:::action --> F["🕵️ Review & release to Credit Management Committee (CMC)"]:::team
+  end
+
+  EXIST --> SEND
+
+  %% 5. CMC
+  subgraph CMC["5) Credit Management Committee (CMC)"]
+    direction LR
+    G["👥 Members: Credit Risk, CFO, CEO"]:::team --> H["⏱️ Decision within 2 working days\n(usually 1 day)"]:::decision
+  end
+
+  SEND --> CMC
+
+  %% 6. Upload decision + notifications
+  subgraph CRM["6) Decision Uploaded to CRM"]
+    direction LR
+    I["🗄️ Upload decision to CRM"]:::system --> J["🔔 Notifications to Sales, RGM, Procurement"]:::notify
+  end
+
+  CMC --> CRM
+
+  %% 7. Procurement
+  subgraph PROC["7) Procurement Team"]
+    direction LR
+    K["🚚 Vehicle purchase process initiated"]:::action
+  end
+
+  CRM --> PROC
+
+  %% Challenges (dashed connectors)
+  ch1(["⚠️ Missing/Incomplete docs → Auto-validate checklist; block submission; request re-upload"]):::challenge
+  B -.-> ch1
+
+  ch2(["⚠️ CRM latency/timeout → Retry with backoff; local queue; alert IT"]):::challenge
+  B -.-> ch2
+
+  ch3(["⚠️ Conflicting approvals → Escalation matrix; SLA timers; audit trail"]):::challenge
+  C -.-> ch3
+
+  ch4(["⚠️ Ageing data stale → nightly sync; freshness checks; fallback report"]):::challenge
+  D -.-> ch4
+
+  ch5(["⚠️ Review backlog → triage by risk; parallel reviewers; SLA dashboard"]):::challenge
+  F -.-> ch5
+
+  ch6(["⚠️ Decision delay > SLA → auto-reminder to CMC; escalate to CFO after T+1"]):::challenge
+  H -.-> ch6
+
+  ch7(["⚠️ Notification failure → redundancy: email + in-app + SMS"]):::challenge
+  J -.-> ch7
+
+  ch8(["⚠️ Supplier shortage → alternate vendors; pre-approved substitutes"]):::challenge
+  K -.-> ch8
+
+

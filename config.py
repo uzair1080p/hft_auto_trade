@@ -24,9 +24,10 @@ CLICKHOUSE_PASS = os.getenv('CLICKHOUSE_PASS', '')
 # Trading pair
 SYMBOL = 'DOGEUSDT'  # Much cheaper than ETH, ~$0.07 vs $4,200+
 
-# Time intervals
-INTERVAL = '1m'  # Data collection interval
-SIGNAL_CHECK_INTERVAL = 5  # Seconds between signal checks
+# Time intervals - HFT optimized
+INTERVAL = '1s'  # 1-second data collection interval
+SIGNAL_CHECK_INTERVAL = 5.0  # 5 seconds between signal checks
+MODEL_INFERENCE_INTERVAL = 10.0  # 10 seconds model inference interval
 
 # Futures trading settings
 LEVERAGE = 10
@@ -34,47 +35,52 @@ MARGIN_TYPE = 'ISOLATED'
 
 # -------------------- Risk Management --------------------
 
-# Position sizing
-POSITION_SIZE_PCT = 0.02  # 2% of account per trade (1 USDT with 50 USDT balance)
-MAX_POSITION_SIZE_PCT = 0.1  # Maximum 10% of account
-MIN_POSITION_SIZE_USDT = 0.5   # Lower minimum for DOGEUSDT (0.5 USDT minimum)
+# Position sizing - Conservative HFT
+POSITION_SIZE_PCT = 0.15  # 15% of account per trade
+MAX_POSITION_SIZE_PCT = 0.20  # Maximum 20% of account
+MIN_POSITION_SIZE_USDT = 5.0   # Minimum 5.0 USDT to meet Binance requirements
 
-# Stop loss and take profit
-STOP_LOSS_PCT = 0.02  # 2% stop loss
-TAKE_PROFIT_PCT = 0.04  # 4% take profit
+# Stop loss and take profit - Conservative HFT
+STOP_LOSS_PCT = 0.01  # 1% stop loss
+TAKE_PROFIT_PCT = 0.02  # 2% take profit
 
 # Risk limits
 MAX_DAILY_LOSS_PCT = 0.05  # 5% maximum daily loss
 MAX_DRAWDOWN_PCT = 0.15  # 15% maximum drawdown
 
+# HFT specific settings
+MAX_TRADES_PER_MINUTE = 5  # Maximum 5 trades per minute (300 per hour)
+MIN_TRADE_INTERVAL = 12.0  # Minimum 12 seconds between trades
+MAX_SLIPPAGE_PCT = 0.001  # Maximum 0.1% slippage tolerance
+
 # -------------------- Model Configuration --------------------
 
-# LSTM settings
-LSTM_SEQUENCE_LENGTH = 20
-LSTM_HIDDEN_SIZE = 32
+# LSTM settings - HFT optimized
+LSTM_SEQUENCE_LENGTH = 10  # Reduced for faster inference
+LSTM_HIDDEN_SIZE = 16  # Reduced for faster inference
 LSTM_LEARNING_RATE = 0.001
 
-# Signal thresholds
-BUY_THRESHOLD = 0.6
-SELL_THRESHOLD = 0.4
+# Signal thresholds - Conservative HFT
+BUY_THRESHOLD = 0.51  # Extremely sensitive for more trading signals
+SELL_THRESHOLD = 0.49  # Extremely sensitive for more trading signals
 HOLD_THRESHOLD = 0.5
 
-# Model ensemble weights
-LSTM_WEIGHT = 0.6
-LIGHTGBM_WEIGHT = 0.4
+# Model ensemble weights (must sum to 1.0)
+LSTM_WEIGHT = 0.4
+LIGHTGBM_WEIGHT = 0.3
 HEURISTIC_WEIGHT = 0.3
 
 # -------------------- Data Collection --------------------
 
-# WebSocket settings
+# WebSocket settings - HFT optimized
 WEBSOCKET_DEPTH = 20
-MAX_TRADE_HISTORY = 500
-MAX_KLINE_HISTORY = 500
+MAX_TRADE_HISTORY = 100  # Reduced for HFT
+MAX_KLINE_HISTORY = 100  # Reduced for HFT
 
-# Feature computation
-RSI_PERIOD = 14
-ATR_PERIOD = 14
-EMA_PERIOD = 10
+# Feature computation - HFT optimized
+RSI_PERIOD = 7  # Shorter period for HFT
+ATR_PERIOD = 7  # Shorter period for HFT
+EMA_PERIOD = 5  # Shorter period for HFT
 
 # -------------------- Logging Configuration --------------------
 
@@ -90,7 +96,7 @@ EXECUTIONS_TABLE = 'trade_executions'
 LIQUIDATION_TABLE = 'liquidation_events'
 
 # Data retention
-DATA_RETENTION_DAYS = 30
+DATA_RETENTION_DAYS = 7  # Reduced for HFT
 
 # -------------------- UI Configuration --------------------
 
@@ -101,6 +107,17 @@ DASHBOARD_HOST = '0.0.0.0'
 # Chart settings
 CHART_HEIGHT = 400
 CHART_WIDTH = 800
+
+# -------------------- HFT Performance Settings --------------------
+
+# Enable real-time processing
+ENABLE_REALTIME_PROCESSING = True
+ENABLE_WEBSOCKET_STREAMS = True
+ENABLE_ORDER_BOOK_ANALYSIS = True
+
+# Threading settings
+MAX_WORKER_THREADS = 4
+QUEUE_SIZE = 1000
 
 # -------------------- Validation Functions --------------------
 
@@ -128,6 +145,12 @@ def validate_config() -> Dict[str, Any]:
     if SELL_THRESHOLD <= 0 or SELL_THRESHOLD >= 1:
         issues.append("SELL_THRESHOLD must be between 0 and 1")
     
+    # Check HFT parameters
+    if SIGNAL_CHECK_INTERVAL < 0.01:
+        issues.append("SIGNAL_CHECK_INTERVAL too low (< 10ms)")
+    if MODEL_INFERENCE_INTERVAL < 0.01:
+        issues.append("MODEL_INFERENCE_INTERVAL too low (< 10ms)")
+    
     return {
         'valid': len(issues) == 0,
         'issues': issues
@@ -148,7 +171,10 @@ def get_trading_config() -> Dict[str, Any]:
         'max_drawdown_pct': MAX_DRAWDOWN_PCT,
         'buy_threshold': BUY_THRESHOLD,
         'sell_threshold': SELL_THRESHOLD,
-        'hold_threshold': HOLD_THRESHOLD
+        'hold_threshold': HOLD_THRESHOLD,
+        'max_trades_per_minute': MAX_TRADES_PER_MINUTE,
+        'min_trade_interval': MIN_TRADE_INTERVAL,
+        'max_slippage_pct': MAX_SLIPPAGE_PCT
     }
 
 def get_model_config() -> Dict[str, Any]:
